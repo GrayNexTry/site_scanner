@@ -1,0 +1,79 @@
+# Релиз: тег vX.Y.Z → архивы под Linux x86_64 и aarch64 (glibc ≥ 2.28) на странице Releases.
+# Вручную (Actions → release → Run workflow) — те же архивы, но только как артефакт сборки.
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Тег совпадает с версией в Cargo.toml
+        if: startsWith(github.ref, 'refs/tags/')
+        run: |
+          v=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
+          [ "v$v" = "$GITHUB_REF_NAME" ] || { echo "тег $GITHUB_REF_NAME, а в Cargo.toml $v"; exit 1; }
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-gnu,aarch64-unknown-linux-gnu
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: zig и cargo-zigbuild
+        run: pip install ziglang cargo-zigbuild
+
+      - name: Сборка архивов
+        run: scripts/dist.sh x86_64 aarch64
+
+      - name: Бинарник запускается
+        run: |
+          tar -xzf dist/maps-seo-scanner-linux-x86_64.tar.gz -C "$RUNNER_TEMP"
+          "$RUNNER_TEMP/maps-seo-scanner-linux-x86_64/maps-seo-scanner" --version
+          objdump -T "$RUNNER_TEMP/maps-seo-scanner-linux-x86_64/maps-seo-scanner" | grep -oE 'GLIBC_[0-9.]+' | sort -Vu | tail -1
+
+      - name: Релиз
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/*.tar.gz
+            dist/*.sha256
+          generate_release_notes: true
+          body: |
+            Готовые сборки для Linux: x86_64 и aarch64 (ARM), любой дистрибутив с glibc 2.28 и новее
+            (Ubuntu 20.04+, Debian 10+, Fedora, Arch, openSUSE, RHEL 8+).
+
+            ```sh
+            curl -LO https://github.com/${{ github.repository }}/releases/download/${{ github.ref_name }}/maps-seo-scanner-linux-x86_64.tar.gz
+            tar -xzf maps-seo-scanner-linux-x86_64.tar.gz
+            cd maps-seo-scanner-linux-x86_64 && ./install.sh
+            maps-seo-scanner --open
+            ```
+
+            Подробности — в README.
+
+      - name: Артефакт (ручной запуск)
+        if: ${{ !startsWith(github.ref, 'refs/tags/') }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/

@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=Сканер карт: остановить сервер
+Comment=Остановить сервер сканера карт, запущенный из лаунчера
+Exec=@LAUNCHER@ stop
+Icon=maps-seo-scanner
+Terminal=false
+StartupNotify=false
+Categories=Office;
+Keywords=seo;maps;scanner;stop;сканер;карты;остановить;выключить;

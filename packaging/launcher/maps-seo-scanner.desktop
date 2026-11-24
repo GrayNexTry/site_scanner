@@ -1,0 +1,16 @@
+[Desktop Entry]
+Type=Application
+Name=Сканер карт
+GenericName=Поиск клиентов по картам
+Comment=Сайты компаний с карт: SEO, ИИ-поиск, лиды. Запускает сервер и открывает интерфейс
+Exec=@LAUNCHER@ open
+Icon=maps-seo-scanner
+Terminal=false
+StartupNotify=false
+Categories=Office;
+Keywords=seo;maps;scanner;leads;audit;сканер;карты;лиды;сайты;аудит;
+Actions=stop;
+
+[Desktop Action stop]
+Name=Остановить сервер
+Exec=@LAUNCHER@ stop

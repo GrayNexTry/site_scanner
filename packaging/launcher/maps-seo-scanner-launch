@@ -1,0 +1,105 @@
+#!/usr/bin/env bash
+# Запуск сканера карт из лаунчера (Walker): сервер поднимается временной службой
+# systemd --user (живёт отдельно от лаунчера, лог — в журнале), затем открывается интерфейс.
+#
+#   maps-seo-scanner-launch open    — запустить, если не запущен, и открыть в браузере (ярлык)
+#   maps-seo-scanner-launch stop    — остановить сервер (второй ярлык)
+#   maps-seo-scanner-launch start   — только запустить, без браузера
+#   maps-seo-scanner-launch status  — работает ли сервер
+#
+# Бинарник: $MAPS_SEO_SCANNER_BIN, иначе лежащий рядом с лаунчером (установка из релиза),
+# иначе свежая сборка репозитория, иначе maps-seo-scanner из PATH.
+# Адрес: $MAPS_SEO_SCANNER_LISTEN (по умолчанию 127.0.0.1:8787).
+set -u
+
+HERE="$(dirname "$(readlink -f "$0")")"
+ROOT="$(cd "$HERE/../.." && pwd)"
+ADDR="${MAPS_SEO_SCANNER_LISTEN:-127.0.0.1:8787}"
+URL="http://$ADDR"
+UNIT="maps-seo-scanner"
+APP="Сканер карт"
+LOG_HINT="Журнал: journalctl --user -u $UNIT"
+
+# Ярлыки сообщают уведомлением (терминала нет), start/status — в вывод.
+say() {
+    if [ "${QUIET_NOTIFY:-0}" = 1 ]; then
+        printf '%s%s\n' "$1" "${2:+ — $2}"
+    else
+        notify-send -a "$APP" -i maps-seo-scanner "$1" "${2:-}" 2>/dev/null || printf '%s%s\n' "$1" "${2:+ — $2}"
+    fi
+}
+
+alive() { curl -sf --max-time 1 "$URL/api/health" >/dev/null 2>&1; }
+ours() { systemctl --user is-active --quiet "$UNIT"; }
+
+binary() {
+    if [ -n "${MAPS_SEO_SCANNER_BIN:-}" ]; then
+        printf '%s' "$MAPS_SEO_SCANNER_BIN"
+    elif [ -x "$HERE/maps-seo-scanner" ]; then
+        printf '%s' "$HERE/maps-seo-scanner"
+    elif [ -x "$ROOT/target/release/maps-seo-scanner" ]; then
+        printf '%s' "$ROOT/target/release/maps-seo-scanner"
+    else
+        command -v maps-seo-scanner || true
+    fi
+}
+
+# Поднять сервер и дождаться ответа (до 30 с). 0 — работает.
+start() {
+    alive && return 0
+    local bin
+    bin="$(binary)"
+    if [ -z "$bin" ] || [ ! -x "$bin" ]; then
+        say "Сканер не собран" "Соберите: $ROOT/scripts/build.sh"
+        return 1
+    fi
+    if ! ours; then
+        # Упавший прошлый запуск мог оставить запись о службе — иначе имя занято.
+        systemctl --user reset-failed "$UNIT" >/dev/null 2>&1
+        if ! systemd-run --user --quiet --collect --unit="$UNIT" --description="$APP (maps-seo-scanner)" \
+            "$bin" --listen "$ADDR" >/dev/null 2>&1; then
+            say "Сервер не запустился" "$LOG_HINT"
+            return 1
+        fi
+    fi
+    for _ in $(seq 60); do
+        alive && return 0
+        # Служба уже завершилась (например, порт занят) — ждать нечего.
+        ours || break
+        sleep 0.5
+    done
+    if alive; then return 0; fi
+    say "Сервер не запустился" "Порт ${ADDR##*:} занят или ошибка при старте. $LOG_HINT"
+    return 1
+}
+
+case "${1:-open}" in
+    open)
+        start && xdg-open "$URL" >/dev/null 2>&1
+        ;;
+    start)
+        QUIET_NOTIFY=1
+        start && echo "Сервер работает: $URL"
+        ;;
+    stop)
+        if ours; then
+            if systemctl --user stop "$UNIT"; then say "Сервер остановлен"; else say "Не удалось остановить сервер" "$LOG_HINT"; fi
+        elif alive; then
+            say "Сервер запущен не из лаунчера" "Остановите его там, где запускали (Ctrl+C в терминале)"
+        else
+            say "Сервер и так не запущен"
+        fi
+        ;;
+    status)
+        if alive; then
+            if ours; then echo "работает: $URL (служба $UNIT)"; else echo "работает: $URL (запущен не из лаунчера)"; fi
+        else
+            echo "не запущен"
+            exit 3
+        fi
+        ;;
+    *)
+        echo "использование: $(basename "$0") [open|start|stop|status]" >&2
+        exit 2
+        ;;
+esac
