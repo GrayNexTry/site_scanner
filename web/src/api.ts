@@ -405,6 +405,8 @@ export interface AiProfile {
   provider: AiProviderPrefs;
   /** Любые другие поля запроса OpenRouter; накладываются последними. */
   extra: Record<string, unknown> | null;
+  /** Есть замечания проверки — попросить модель исправить их (ещё один запрос). */
+  fix_lint: boolean;
 }
 
 export interface AiModel {
@@ -471,6 +473,8 @@ export interface MessageAi {
   lang: "ru" | "en";
   attempts: number;
   original: { subject: string; body: string };
+  /** Первый вариант до исправления по замечаниям. */
+  first?: { content: string; lint: string[]; cost: number | null; ms: number } | null;
 }
 
 /** Сведения нейросети о письме; у шаблона и своего текста — null. */

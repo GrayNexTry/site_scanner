@@ -581,6 +581,16 @@ export function AiSettingsCard({ value, onChange, keyInput }: { value: AiSetting
           </div>
         </div>
 
+        <label className="check">
+          <input type="checkbox" checked={p.fix_lint} onChange={(e) => set({ fix_lint: e.target.checked })} />
+          <span>
+            <b>Исправлять по замечаниям проверки</b>
+            <span className="hint" style={{ display: "block" }}>
+              Если в тексте нашлись «заметил», громкие слова, markdown и т. п., модель получает список замечаний и правит текст — ещё один запрос, только когда есть что
+              исправить. Первый вариант виден в черновике.
+            </span>
+          </span>
+        </label>
         <ExtraField key={p.id} value={p.extra} onChange={(v) => set({ extra: v })} />
         <TryOnBusiness profile={p} />
         <span className="hint">Правки профилей применяются после «Сохранить» внизу страницы; проба выше берёт их сразу.</span>

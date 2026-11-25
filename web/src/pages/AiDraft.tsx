@@ -168,6 +168,7 @@ function DraftItem({ m, active, onUse, onDelete }: { m: Message; active: boolean
           <span className="faint"> · {m.ai && "source" in m.ai && m.ai.source === "template" ? "шаблон сканера" : "свой текст"}</span>
         )}
         {lint.length > 0 && <span className="st-warn"> · замечаний: {lint.length}</span>}
+        {ai?.first && <span className="faint"> · исправлено по замечаниям</span>}
         {edited && <span className="faint"> · правлен</span>}
         {active && <span className="faint"> · в поле</span>}
       </summary>
@@ -185,6 +186,12 @@ function DraftItem({ m, active, onUse, onDelete }: { m: Message; active: boolean
             Профиль «{ai.profile_name}», модель {ai.model || ai.model_requested}{ai.provider ? ` (${ai.provider})` : ""}; токены: запрос {ai.usage.prompt}, ответ {ai.usage.completion}
             {ai.usage.reasoning ? `, из них рассуждение ${ai.usage.reasoning}` : ""}{ai.attempts > 1 ? `; попыток: ${ai.attempts}` : ""}
           </span>
+        )}
+        {ai?.first && (
+          <details>
+            <summary className="small">Первый вариант (до исправления: {ai.first.lint.join(" ")})</summary>
+            <pre className="small" style={{ whiteSpace: "pre-wrap", margin: 0, fontFamily: "inherit" }}>{ai.first.content}</pre>
+          </details>
         )}
         {ai?.reasoning && (
           <details>

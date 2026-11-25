@@ -300,11 +300,36 @@ async fn generate(st: &Shared, bid: i64, kind: Kind, profile: &AiProfile, cancel
             Err(e) => return Err(GenError::Ai(e)),
         }
     };
-    let letter = llm::parse_letter(&res.content, kind);
+    let mut letter = llm::parse_letter(&res.content, kind);
     if letter.body.trim().is_empty() {
         return Err(GenError::Ai(AiError { status: 502, message: format!("Не удалось достать текст из ответа модели: {}", res.content.chars().take(200).collect::<String>()), retry_after: None }));
     }
-    let lint = llm::lint_letter(&letter, kind, prep.lang, &prep.must);
+    let mut lint = llm::lint_letter(&letter, kind, prep.lang, &prep.must);
+    // Замечания проверки — один раз попросить модель исправить их; лучше не стало — остаётся первый вариант.
+    let mut first: Option<Value> = None;
+    let mut res = res;
+    if profile.fix_lint && !lint.is_empty() {
+        let fix_body = llm::build_fix_request(&built.body, &res.content, &lint, prep.lang);
+        match st.ai.client.chat(&key, &fix_body).await {
+            Ok(r2) => {
+                let l2 = llm::parse_letter(&r2.content, kind);
+                let lint2 = llm::lint_letter(&l2, kind, prep.lang, &prep.must);
+                if !l2.body.trim().is_empty() && lint2.len() < lint.len() {
+                    first = Some(json!({"content": res.content, "lint": lint, "cost": res.cost, "ms": res.ms}));
+                    let cost = res.cost.zip(r2.cost).map(|(a, b)| a + b).or(r2.cost).or(res.cost);
+                    let (ms, prompt, completion, reasoning) = (res.ms + r2.ms, res.prompt_tokens + r2.prompt_tokens, res.completion_tokens + r2.completion_tokens, res.reasoning_tokens + r2.reasoning_tokens);
+                    res = llm::ChatResult { cost, ms, prompt_tokens: prompt, completion_tokens: completion, reasoning_tokens: reasoning, ..r2 };
+                    letter = l2;
+                    lint = lint2;
+                } else {
+                    // Исправление не помогло — цену второго запроса всё равно учесть.
+                    res.cost = res.cost.zip(r2.cost).map(|(a, b)| a + b).or(res.cost);
+                    res.ms += r2.ms;
+                }
+            }
+            Err(e) => warn!("нейросеть, компания {bid}: исправление по замечаниям не удалось: {}", e.message),
+        }
+    }
     let ai = json!({
         "profile_id": profile.id,
         "profile_name": profile.name,
@@ -324,6 +349,8 @@ async fn generate(st: &Shared, bid: i64, kind: Kind, profile: &AiProfile, cancel
         "lint": lint,
         "lang": prep.lang,
         "attempts": attempt,
+        // Первый вариант до исправления по замечаниям (если исправляли).
+        "first": first,
         // Исходный текст модели — чтобы потом видеть, что менеджер поправил перед отправкой.
         "original": {"subject": letter.subject, "body": letter.body},
     });
@@ -567,8 +594,11 @@ mod tests {
                         let email = body["response_format"]["json_schema"]["schema"]["required"] == json!(["subject", "body"]);
                         let content = if email {
                             json!({"subject": "Сайт belodent.by — что мешает пациентам", "body": "Здравствуйте! На belodent.by нашлось две проблемы:\n— раз\n— два\n\nС уважением,\nhello@example.com"}).to_string()
+                        } else if body["messages"].as_array().unwrap().len() > 2 {
+                            // Просьба исправить по замечаниям — чистый текст.
+                            json!({"body": "Здравствуйте! На сайте видно пару мелочей.\n\nПочта для связи: hello@example.com"}).to_string()
                         } else {
-                            json!({"body": "Здравствуйте! Коротко о сайте.\n\nПочта для связи: hello@example.com"}).to_string()
+                            json!({"body": "Здравствуйте! Заглянул на ваш сайт.\n\nПочта для связи: hello@example.com"}).to_string()
                         };
                         (StatusCode::OK, Json(json!({"id": "gen-1", "model": "test/model", "provider": "Fake",
                             "choices": [{"finish_reason": "stop", "message": {"content": content, "reasoning": "Сначала о главном."}}],
@@ -660,11 +690,15 @@ mod tests {
         let v = wait_batch(&app).await;
         assert_eq!((v["done"].as_u64(), v["skipped"].as_u64(), v["failed"].as_u64()), (Some(0), Some(2), Some(0)), "{v}");
         assert!(v["errors"][0]["error"].as_str().unwrap().contains("не проверен"));
-        // Сообщения в мессенджер ещё нет — составится.
+        // Сообщения в мессенджер ещё нет — составится; «Заглянул» модель исправит вторым запросом.
         call(app.clone(), "POST", "/api/ai/batch", Some(json!({"ids": [bid], "kind": "short"}))).await;
         let v = wait_batch(&app).await;
         assert_eq!((v["done"].as_u64(), v["drafted"][0].as_i64()), (Some(1), Some(bid)), "{v}");
-        assert!((v["cost"].as_f64().unwrap() - 0.0011).abs() < 1e-9);
+        assert!((v["cost"].as_f64().unwrap() - 0.0022).abs() < 1e-9, "цена — за оба запроса: {v}");
+        let (_, list) = call(app.clone(), "GET", &format!("/api/businesses/{bid}/drafts"), None).await;
+        let short = list.as_array().unwrap().iter().find(|m| m["kind"] == "short").unwrap();
+        assert!(short["body"].as_str().unwrap().contains("пару мелочей") && short["ai"]["lint"] == json!([]), "{short}");
+        assert!(short["ai"]["first"]["content"].as_str().unwrap().contains("Заглянул"), "первый вариант сохранён");
 
         // Кредиты кончились — партия останавливается с причиной, а не перебирает всех.
         broke.store(true, Ordering::Relaxed);
@@ -673,7 +707,7 @@ mod tests {
         assert_eq!((v["failed"].as_u64(), v["stopped"].as_bool()), (Some(1), Some(true)), "{v}");
         assert!(v["stop_reason"].as_str().unwrap().contains("кредитов"), "{v}");
         let requests = seen.lock().unwrap().len();
-        assert_eq!(requests, 3, "402 не повторяем");
+        assert_eq!(requests, 4, "письмо, сообщение с исправлением (2), 402 — без повторов");
 
         let (st, _) = call(app.clone(), "DELETE", &format!("/api/messages/{mid}"), None).await;
         assert_eq!(st, StatusCode::OK);

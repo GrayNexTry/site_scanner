@@ -122,6 +122,8 @@ pub struct AiProfile {
     /// Любые другие поля запроса OpenRouter (JSON-объект): накладываются поверх собранного запроса последними,
     /// `null` убирает поле.
     pub extra: Value,
+    /// Есть замечания проверки — попросить модель исправить их (ещё один запрос, только когда нужно).
+    pub fix_lint: bool,
 }
 
 impl Default for AiProfile {
@@ -150,6 +152,7 @@ impl Default for AiProfile {
             reasoning: Reasoning::default(),
             provider: ProviderPrefs::default(),
             extra: Value::Null,
+            fix_lint: true,
         }
     }
 }
@@ -163,7 +166,7 @@ pub const DEFAULT_SYSTEM: &str = "Ты помогаешь написать пе�
 — Назови одну-две самые заметные проблемы из запроса и одной фразой — чем они мешают клиентам компании. Не перечисляй всё подряд и не пугай («вы теряете клиентов», «срочно»).
 — Только факты из запроса. Не придумывай цифр, сроков, цен, отзывов и обещаний вроде «первое место в поиске».
 — Простые слова вместо терминов: не «HTTPS», «мета-теги», «schema», «Core Web Vitals», а что человек видит на сайте или в поиске.
-— От первого лица без глаголов прошедшего времени с родом (не «нашёл», «посмотрела», «заметил»): пиши «на сайте видно», «есть», «нашлось».
+— Никаких глаголов прошедшего времени от первого лица — они выдают пол отправителя: нельзя «заметил(а)», «заглянул(а)», «посмотрел(а)», «нашёл/нашла», «проверил(а)», «приложил(а)», «обратил(а) внимание». Пиши в настоящем времени или безлично: «на сайте видно», «браузер показывает», «есть», «нашлось», «прикладываю разбор».
 — Если дана ссылка на примеры работ, скажи о примерах одной фразой, без хвастовства: в письме ссылка уже стоит в подписи — в тексте её не повторяй; в сообщении для мессенджера дай ссылку в тексте. Если ссылки нет — не упоминай портфолио.
 — Предложение — мягкое: «если интересно, расскажу подробнее» или «могу показать, что стоит поправить». Без цены и без давления.
 — Не пиши, что текст составлен автоматически или нейросетью, не называй программ и сервисов проверки.
@@ -662,6 +665,22 @@ pub fn build_request(p: &AiProfile, kind: Kind, vars: &BTreeMap<String, String>,
     BuiltRequest { body, unknown_vars: unknown, unsupported }
 }
 
+/// Запрос «исправь по замечаниям»: тот же разговор, ответ модели и список замечаний; формат ответа прежний.
+pub fn build_fix_request(body: &Value, content: &str, issues: &[String], lang: &str) -> Value {
+    let mut b = body.clone();
+    let list = issues.iter().map(|i| format!("— {i}")).collect::<Vec<_>>().join("\n");
+    let ask = if lang == "en" {
+        format!("Fix only these issues in your text, keep everything else as is:\n{list}\n\nReply in the same format.")
+    } else {
+        format!("Исправь в своём тексте только эти замечания, остальное оставь как есть:\n{list}\n\nОтветь в том же формате.")
+    };
+    if let Some(msgs) = b["messages"].as_array_mut() {
+        msgs.push(json!({"role": "assistant", "content": content}));
+        msgs.push(json!({"role": "user", "content": ask}));
+    }
+    b
+}
+
 // ---------------------------------------------------------------- ответ
 
 /// Что вернула модель.
@@ -862,12 +881,15 @@ pub fn lint_letter(l: &Letter, kind: Kind, lang: &str, must_contain: &[String]) 
         out.push(format!("Заготовка в квадратных скобках: {} — модель не подставила данные.", m.as_str()));
     }
     if lang == "ru" {
+        // Глаголы, которые в письме почти всегда от первого лица, — в любом месте; двусмысленные
+        // («сделал», «решил» — их делает и подрядчик) — только после «я» или в начале предложения.
         let g = re(
-            r"(?i)(?:^|[.!?\n]\s*|\bя\s+(?:\S+\s+)?)(наш[её]л|нашла|посмотрела?|проверила?|заметила?|увидела?|изучила?|проанализировала?|подготовила?|обратила?|решила?|сделала?)\b",
+            r"(?i)\b(наш[её]л|нашла|заглянула?|посмотрела?|просмотрела?|проверила?|заметила?|увидела?|изучила?|проанализировала?|приложила?|подготовила?|обратила?|наткнул(?:ся|ась)|прош[её]лся|прошлась|заш[её]л|зашла)\b|(?:^|[.!?\n]\s*|\bя\s+(?:\S+\s+)?)(решила?|сделала?|открыла?)\b",
             &GENDER,
         );
         if let Some(c) = g.captures(&text) {
-            out.push(format!("Глагол с родом от первого лица: «{}» — по правилам лучше «нашлось», «вижу», «есть».", &c[1]));
+            let w = c.get(1).or(c.get(2)).map(|m| m.as_str()).unwrap_or("");
+            out.push(format!("Глагол с родом от первого лица: «{w}» — выдаёт пол отправителя; лучше «на сайте видно», «есть», «прикладываю»."));
         }
     }
     if let Some(m) = re(r"(?i)seo-специалист|seo-эксперт|\bэксперт\w*|под ключ|уникальн\w*|гарантир\w*|в топ\b|в топе\b|seo expert|guarantee\w*", &LOUD).find(&text) {
@@ -1074,6 +1096,18 @@ mod tests {
     }
 
     #[test]
+    fn fix_request_continues_the_dialog() {
+        let body = json!({"model": "m", "messages": [{"role": "user", "content": "напиши"}], "response_format": {"type": "json_object"}});
+        let fixed = build_fix_request(&body, "{\"body\":\"Заглянул…\"}", &["Глагол с родом: «Заглянул»".into()], "ru");
+        let msgs = fixed["messages"].as_array().unwrap();
+        assert_eq!(msgs.len(), 3);
+        assert_eq!((msgs[1]["role"].as_str(), msgs[2]["role"].as_str()), (Some("assistant"), Some("user")));
+        assert!(msgs[2]["content"].as_str().unwrap().contains("— Глагол с родом: «Заглянул»"));
+        assert_eq!(fixed["response_format"], body["response_format"], "формат ответа тот же");
+        assert_eq!(body["messages"].as_array().unwrap().len(), 1, "исходный запрос не трогаем");
+    }
+
+    #[test]
     fn normalize_cleans_profiles() {
         let bad = AiProfile { id: " мой профиль! ".into(), name: "  ".into(), json_mode: "maybe".into(), extra: json!([1]), stop: vec!["".into(), "\n\n".into()], ..Default::default() };
         let list = normalize_profiles(&[bad.clone(), bad]);
@@ -1116,6 +1150,11 @@ mod tests {
         assert!(lint_letter(&third, Kind::Short, "ru", &[]).is_empty());
         let start = Letter { subject: "".into(), body: "Здравствуйте! Нашла у вас ошибку.".into() };
         assert!(lint_letter(&start, Kind::Short, "ru", &[]).iter().any(|i| i.contains("Нашла")));
+        // Реальный ответ модели 25.11: «Заглянул…», «Ещё заметил…», «приложил» — посреди предложения тоже ловим.
+        let mid = Letter { subject: "".into(), body: "Ещё заметил, что карты сайта нет. К письму приложил разбор.".into() };
+        assert!(lint_letter(&mid, Kind::Short, "ru", &[]).iter().any(|i| i.contains("заметил")));
+        let ok_present = Letter { subject: "".into(), body: "На сайте видно, что карты сайта нет. Прикладываю разбор.".into() };
+        assert!(lint_letter(&ok_present, Kind::Short, "ru", &[]).is_empty());
         let en = Letter { subject: "".into(), body: "Hello! I took a look at your website and found a few problems that cost you customers.".into() };
         assert!(lint_letter(&en, Kind::Short, "ru", &[]).iter().any(|i| i.contains("не на русском")));
         assert!(lint_letter(&en, Kind::Short, "en", &[]).is_empty());
