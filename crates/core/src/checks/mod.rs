@@ -8,7 +8,7 @@ mod content;
 mod tech;
 mod yandex;
 
-pub use content::address_matches;
+pub use content::{address_matches, gambling_hijack};
 
 use std::collections::HashSet;
 
@@ -118,10 +118,32 @@ pub fn run_all(ctx: &CheckCtx) -> Vec<MetricResult> {
         }
     }
     fill_missing(&mut out, site_state, manual, ctx.site.and_then(|s| s.psi.as_ref()).map(|p| p.error.clone()));
+    // Раздел A: клиентские формулировки называют карту, если данные только из OpenStreetMap или Overture.
+    if let Some(maps) = open_maps_label(ctx.business) {
+        for r in out.iter_mut().filter(|r| r.id.starts_with('A')) {
+            r.maps = Some(maps.clone());
+        }
+    }
     let order: std::collections::HashMap<&str, usize> =
         catalog().metrics.iter().enumerate().map(|(i, m)| (m.id.as_str(), i)).collect();
     out.sort_by_key(|r| order.get(r.id.as_str()).copied().unwrap_or(usize::MAX));
     out
+}
+
+/// Название карты, на которой проверена карточка, если среди источников нет Google и Яндекса:
+/// «OpenStreetMap» (при наличии OSM), иначе «Overture Maps». `None` — есть Google или Яндекс (говорим «на картах»)
+/// или источников карт нет вовсе.
+pub fn open_maps_label(b: &crate::model::Business) -> Option<String> {
+    let has = |k: ProviderKind| b.sources.iter().any(|s| s.provider == Some(k));
+    if has(ProviderKind::Google) || has(ProviderKind::Yandex) {
+        None
+    } else if has(ProviderKind::Osm) {
+        Some(ProviderKind::Osm.label().to_string())
+    } else if has(ProviderKind::Overture) {
+        Some(ProviderKind::Overture.label().to_string())
+    } else {
+        None
+    }
 }
 
 /// Главная не работает (ошибка, парковка, заглушка «в разработке», страница хостера) — оценивать
@@ -137,7 +159,12 @@ fn not_a_site(out: &mut [MetricResult]) {
         return;
     }
     const KEEP: &[&str] = &["B01", "B02", "B03", "B13", "F14", "O06"];
-    for r in out.iter_mut().filter(|r| !r.id.starts_with('A') && !KEEP.contains(&r.id.as_str()) && matches!(r.status, Status::Fail | Status::Warn | Status::Pass)) {
+    for r in out.iter_mut().filter(|r| {
+        !r.id.starts_with('A')
+            // Пройденное — «в порядке» — у сайта, которого по факту нет, не показывается совсем:
+            // «Сайт открывается без ошибок», «Заглушек нет», «Регистрация домена оплачена» были бы ложью.
+            && (r.status == Status::Pass || (!KEEP.contains(&r.id.as_str()) && matches!(r.status, Status::Fail | Status::Warn)))
+    }) {
         *r = MetricResult::na(&r.id, "Сайт не работает или вместо него заглушка — остальное не проверялось");
     }
 }

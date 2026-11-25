@@ -535,8 +535,10 @@ async fn read_capped(mut resp: reqwest::Response, max: usize) -> Result<(Vec<u8>
     }
 }
 
+/// Тело — текст. JS («application/javascript») тоже: без него свои скрипты сайта приходили
+/// пустыми, и счётчики в бандлах не находились (everestdent.by: GA4 и Метрика в autoptimize_*.js).
 fn is_textual(ct: &str) -> bool {
-    ct.starts_with("text/") || ct.contains("html") || ct.contains("xml") || ct.contains("json")
+    ct.starts_with("text/") || ["html", "xml", "json", "javascript", "ecmascript"].iter().any(|t| ct.contains(t))
 }
 
 /// Перекодировка тела: charset из Content-Type, иначе из <meta charset>, иначе UTF-8.

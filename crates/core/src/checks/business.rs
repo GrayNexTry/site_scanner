@@ -11,6 +11,9 @@ use crate::providers::presets::is_medical;
 use crate::region::Jurisdiction;
 use crate::text::registrable_domain;
 
+/// M03: уведомление о cookie нужно только при счётчиках — без них проверять нечего.
+const NO_COUNTERS: &str = "Уведомление не требуется: счётчиков на сайте нет";
+
 /// Контрольная сумма ИНН (10 или 12 цифр).
 pub fn inn_valid(inn: &str) -> bool {
     let d: Vec<u32> = inn.chars().filter_map(|c| c.to_digit(10)).collect();
@@ -80,10 +83,10 @@ pub fn run(ctx: &CheckCtx, v: &SiteView, out: &mut Vec<MetricResult>) {
     let cookie_text = text.contains("cookie") || text.contains("куки");
     out.push(match jur {
         Jurisdiction::Eu | Jurisdiction::Uk => {
-            if !cmp.is_empty() {
+            if !html_trackers && cmp.is_empty() {
+                MetricResult::na("M03", NO_COUNTERS)
+            } else if !cmp.is_empty() {
                 MetricResult::pass("M03", format!("Баннер согласия на cookie: {}", cmp[0]))
-            } else if !html_trackers {
-                MetricResult::pass("M03", "Трекеров нет — баннер не обязателен")
             } else if cookie_text {
                 MetricResult::warn("M03", "Есть текст о cookie, но платформы согласия не видно — трекеры могут стартовать до согласия")
             } else {
@@ -95,18 +98,20 @@ pub fn run(ctx: &CheckCtx, v: &SiteView, out: &mut Vec<MetricResult>) {
             let opt_out = link_has(&["do not sell", "do-not-sell", "your privacy choices", "opt-out", "opt out"]);
             if pixels && !opt_out {
                 MetricResult::warn("M03", "Рекламные пиксели без ссылки «Do Not Sell or Share» (CCPA, если есть клиенты из Калифорнии)")
+            } else if !pixels && !opt_out {
+                MetricResult::na("M03", NO_COUNTERS)
             } else {
-                MetricResult::pass("M03", if opt_out { "Ссылка отказа от продажи данных есть" } else { "Рекламных пикселей нет" })
+                MetricResult::pass("M03", "Ссылка отказа от продажи данных есть")
             }
         }
         _ => {
             let analytics = lexicon::ANALYTICS.iter().any(|(m, _)| html.contains(m));
-            if cookie_text || !cmp.is_empty() {
+            if !analytics {
+                MetricResult::na("M03", NO_COUNTERS)
+            } else if cookie_text || !cmp.is_empty() {
                 MetricResult::pass("M03", "Уведомление о cookie есть")
-            } else if analytics {
-                MetricResult::warn("M03", "Метрики стоят, а уведомления о cookie нет")
             } else {
-                MetricResult::pass("M03", "Метрик нет — уведомление не обязательно")
+                MetricResult::warn("M03", "Метрики стоят, а уведомления о cookie нет")
             }
         }
     });
@@ -238,6 +243,8 @@ pub fn run(ctx: &CheckCtx, v: &SiteView, out: &mut Vec<MetricResult>) {
         MetricResult::pass("N02", "Кликабельный телефон в шапке")
     } else if !page.tel_links.is_empty() {
         MetricResult::warn("N02", "Телефон кликабелен, но не в шапке")
+    } else if page.header_phone_text {
+        MetricResult::warn("N02", "Телефон в шапке есть, но не кликабелен — нет ссылки tel:").with_value("header_text")
     } else {
         MetricResult::fail("N02", "Кликабельного телефона нет")
     });
@@ -327,6 +334,12 @@ pub fn run(ctx: &CheckCtx, v: &SiteView, out: &mut Vec<MetricResult>) {
         MetricResult::pass("P01", if html.contains("webvisor:true") || html.contains("webvisor: true") { "Яндекс Метрика с Вебвизором" } else { "Яндекс Метрика" })
     } else if analytics.is_empty() && wix {
         MetricResult::na("P01", "Сайт на Wix: счётчики подключаются через настройки Wix и в коде страницы не видны — проверить вручную")
+    } else if analytics.is_empty() && v.snap.site_js_unchecked > 0 {
+        // perfectsmile.by: Next.js, 25 файлов скриптов, Метрика — в 14-м.
+        MetricResult::na(
+            "P01",
+            format!("В коде страницы и первых скриптах счётчиков нет, ещё {} файлов скриптов не проверялись — проверить вручную", v.snap.site_js_unchecked),
+        )
     } else if analytics.is_empty() {
         MetricResult::fail("P01", "Веб-аналитики нет — результат работ не измерить")
     } else if jur == Jurisdiction::Ru {
@@ -347,7 +360,16 @@ pub fn run(ctx: &CheckCtx, v: &SiteView, out: &mut Vec<MetricResult>) {
     if let Some(a) = v.snap.psi.as_ref().filter(|p| p.error.is_none()).and_then(|p| p.a11y) {
         out.push(grade_high("Q01", a, 90.0, 50.0, format!("{a} из 100")));
     }
-    let fields: Vec<_> = v.pages.iter().flat_map(|p| p.forms.iter()).flat_map(|f| f.fields.iter()).collect();
+    // Одна и та же форма (обратный звонок в шапке) есть на каждой обойдённой странице: поле считаем
+    // один раз, иначе выходит «0 из 138» вместо «0 из 9».
+    let mut seen = std::collections::HashSet::new();
+    let fields: Vec<_> = v
+        .pages
+        .iter()
+        .flat_map(|p| p.forms.iter())
+        .flat_map(|f| f.fields.iter())
+        .filter(|f| seen.insert((f.kind.clone(), f.name.clone())))
+        .collect();
     if fields.is_empty() {
         out.push(MetricResult::na("Q03", "Форм нет"));
     } else {

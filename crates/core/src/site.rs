@@ -274,8 +274,11 @@ pub struct SiteSnapshot {
     pub input_broken: Option<u16>,
     /// Сайт проверен через свой прокси (напрямую не открылся или прокси включён для всего).
     pub via_proxy: bool,
-    /// Свои JS-файлы сайта (до двух), если счётчиков аналитики нет в HTML.
+    /// Свои JS-файлы сайта (до шести), если счётчиков аналитики нет в HTML.
     pub site_js_lower: String,
+    /// Своих скриптов сайта, которые не скачивались (бандлы Next.js — десятки файлов):
+    /// не нашли счётчик — это ещё не «аналитики нет».
+    pub site_js_unchecked: usize,
     /// Сертификат не прошёл строгую проверку, содержимое загружено без неё.
     pub tls_lenient: bool,
     /// Скан шёл с IP другой страны, чем район.
@@ -320,7 +323,14 @@ impl SiteSnapshot {
 
     pub fn https_without_redirect(&self) -> bool {
         self.https_probe.as_ref().is_some_and(|p| p.error.is_none() && p.final_status.is_some_and(|c| c < 400))
-            && self.tls.as_ref().is_some_and(|t| t.valid)
+            && self.tls.as_ref().is_some_and(|t| t.valid || (self.tls_unread() && !self.tls_lenient))
+    }
+
+    /// TLS-проба не получила сертификат вовсе (сеть оборвала рукопожатие) — о сертификате она
+    /// ничего не знает. Если при этом https-страница открылась со строгой проверкой
+    /// (не `tls_lenient`), сертификат у сайта рабочий.
+    pub fn tls_unread(&self) -> bool {
+        self.tls.as_ref().is_some_and(|t| !t.valid && t.issuer.is_none() && t.days_left.is_none())
     }
 
     /// Короткая сводка для интерфейса.
@@ -343,6 +353,7 @@ impl SiteSnapshot {
             "rendered": self.raw_words.is_some(),
             "render_error": self.render_error,
             "title": self.page.as_ref().and_then(|p| p.title.clone()),
+            "site_name": self.page.as_ref().and_then(|p| p.og.iter().find(|(k, _)| k == "og:site_name").map(|(_, v)| v.clone())),
             "words": self.page.as_ref().map(|p| p.words),
             "pages_crawled": self.pages.len(),
             "sitemap_urls": self.sitemap.urls.len(),
@@ -350,6 +361,7 @@ impl SiteSnapshot {
             "tls": self.tls,
             "domain": self.domain,
             "psi": self.psi,
+            "contacts": crate::sales::site_contacts(self),
             "elapsed_ms": self.elapsed_ms,
         })
     }
@@ -416,7 +428,15 @@ pub fn looks_like_challenge(f: &Fetched) -> bool {
         return true;
     }
     let head: String = f.body.chars().take(4000).collect::<String>().to_lowercase();
-    if ["<title>just a moment", "<title>attention required", "<title>проверка браузера", "<title>access denied"].iter().any(|m| head.contains(m)) {
+    if [
+        "<title>just a moment", "<title>attention required", "<title>проверка браузера", "<title>access denied",
+        // WPX («Security Challenge», grid24), Simply.com («Checking your browser», 454), SiteGround, Sucuri, Imunify360.
+        "<title>checking your browser", "<title>security challenge", "<title>verifying", "<title>please wait while",
+        "<title>robot challenge", "<title>sucuri website firewall", "<title>bot verification",
+    ]
+    .iter()
+    .any(|m| head.contains(m))
+    {
         return true;
     }
     // Заглушки защиты маленькие; на больших страницах слова вроде «captcha» встречаются законно.
@@ -428,6 +448,8 @@ pub fn looks_like_challenge(f: &Fetched) -> bool {
         "just a moment", "cf-chl", "/cdn-cgi/challenge-platform", "attention required", "ddos-guard",
         "checking your browser", "qrator", "servicepipe", "variti", "stormwall", "access denied", "bm-verify",
         "_sec/cp_challenge", "sec-if-cpt", "проверка браузера", "geoip",
+        "wpx security", "wpxsecurity", "sgcaptcha", "sucuri website firewall", "imunify360", "verify you are human",
+        "verifying your browser", "bot verification",
     ]
     .iter()
     .any(|m| head.contains(m))
@@ -438,7 +460,8 @@ pub fn is_blocked(home: &Fetched) -> bool {
     // 451 — закрыто по закону или для страны; 404 от DDoS-Guard — его заглушка для чужих IP.
     let ddos_guard = home.header("server").is_some_and(|s| s.to_ascii_lowercase().contains("ddos-guard"))
         && !home.body.to_lowercase().contains("domain has been assigned");
-    matches!(home.status, 401 | 403 | 429 | 451 | 498 | 503) || (home.status == 404 && ddos_guard) || (home.ok() && looks_like_challenge(home))
+    // Заглушка защиты — при любом коде: Simply.com отдаёт «Checking your browser» с кодом 454.
+    matches!(home.status, 401 | 403 | 429 | 451 | 498 | 503) || (home.status == 404 && ddos_guard) || looks_like_challenge(home)
 }
 
 /// Код ответа публичного DNS (Cloudflare DoH): 0 — есть, 2 — сервер домена не отвечает,
@@ -477,6 +500,8 @@ fn crawl_priority(href: &str, text: &str) -> i32 {
     if has(&[
         "contact", "kontakt", "контакт", "svyaz", "связ", "get-in-touch", "get in touch", "impressum", "reach-us", "find-us", "contatt",
         "contato", "nous-trouver", "como-llegar", "anfahrt",
+        // США и Европа: «Hours/Location», «Directions», «Visit us» — там телефон и адрес (brewersrownyc.com/location).
+        "location", "hours", "directions", "visit-us", "visit us", "как добраться", "kak-dobratsya", "standort", "orari",
     ]) {
         30
     } else if has(&[
@@ -495,10 +520,12 @@ fn crawl_priority(href: &str, text: &str) -> i32 {
     ]) {
         15
     } else if has(&["faq", "vopros", "voprosy", "вопрос", "questions", "preguntas", "fragen", "domande", "pytania"]) {
-        12
+        // Выше страниц услуг: страница вопросов одна, а услуг много — иначе до /faq обход не доходит
+        // (vip-permanent.by/vopros/, 8tm.by/faq — I09 «вопросов нет»).
+        24
     } else if has(&[
         "about", "o-nas", "о нас", "о компании", "o-kompanii", "ueber-uns", "uber-uns", "a-propos", "qui-sommes", "sobre-nosotros",
-        "quienes-somos", "chi-siamo", "over-ons", "sobre-nos",
+        "quienes-somos", "chi-siamo", "over-ons", "sobre-nos", "/company", "о-нас", "о-компании", "о-клинике", "o-klinike", "o-firmie",
     ]) {
         10
     } else if has(&["blog", "news", "novost", "новост", "stati", "статьи"]) {
@@ -620,7 +647,7 @@ async fn collect_once(f: &Fetcher, input: &str, opt: &CollectOptions) -> SiteSna
         // Дальше долбить сайт бессмысленно: собираем только TLS и данные домена.
         let reg = registrable_domain(&host);
         let (tls_i, dom, dns) = tokio::join!(
-            async { if final_url.scheme() == "https" { Some(tls::probe(&host).await) } else { None } },
+            async { if final_url.scheme() == "https" { Some(tls::probe(&host, f.interface()).await) } else { None } },
             domain_info::lookup(&f.api, &reg),
             domain_info::dns(&f.api, &reg),
         );
@@ -642,18 +669,20 @@ async fn collect_once(f: &Fetcher, input: &str, opt: &CollectOptions) -> SiteSna
                     .scripts
                     .iter()
                     .filter_map(|t| t.src.clone())
-                    .filter(|src| Url::parse(src).ok().is_some_and(|u| host_of(&u) == host))
+                    .filter(|src| Url::parse(src).ok().is_some_and(|u| host_of(&u).trim_start_matches("www.") == host.trim_start_matches("www.")))
                     .filter(|src| !["jquery", "vendor", "bootstrap", "swiper", "slick", "polyfill"].iter().any(|v| src.to_lowercase().contains(v)))
                     .collect();
-                // Сначала скрипты с говорящими именами (cookies.js, metrika.js, analytics), всего до 4.
+                // Сначала скрипты с говорящими именами (cookies.js, metrika.js, analytics), всего до 6:
+                // счётчики часто в общем бандле (main.*.js, autoptimize_*.js), включаемые после согласия на cookie.
                 let mut own = own;
                 own.sort_by_key(|src| {
                     let l = src.to_lowercase();
                     !["metrika", "analytic", "counter", "cookie", "gtm", "ym", "stat"].iter().any(|k| l.contains(k))
                 });
-                own.truncate(4);
+                s.site_js_unchecked = own.len().saturating_sub(6);
+                own.truncate(6);
                 for src in own {
-                    if let Ok(r) = f.get_limited(&src, None, 600 * 1024).await
+                    if let Ok(r) = f.get_limited(&src, None, 2 * 1024 * 1024).await
                         && r.ok()
                     {
                         s.site_js_lower.push_str(&r.body.to_lowercase());
@@ -741,7 +770,7 @@ async fn collect_once(f: &Fetcher, input: &str, opt: &CollectOptions) -> SiteSna
     let external = async {
         tokio::join!(
             // Сертификат проверяем и у сайта на http://: часто HTTPS есть, но нет перенаправления.
-            async { Some(tls::probe(&host).await) },
+            async { Some(tls::probe(&host, f.interface()).await) },
             domain_info::lookup(&f.api, &reg_domain),
             domain_info::dns_for(&f.api, &host, &reg_domain),
             async {
@@ -876,8 +905,15 @@ async fn collect_once(f: &Fetcher, input: &str, opt: &CollectOptions) -> SiteSna
     let mut prio: HashMap<String, i32> = HashMap::new();
     let push_links = |info: &PageInfo, depth: u8, seen: &mut HashSet<String>, frontier: &mut Vec<(String, u8)>, prio: &mut HashMap<String, i32>| {
         for l in info.links.iter().filter(|l| l.internal) {
-            let Ok(u) = Url::parse(&l.href) else { continue };
-            if u.host_str() != Some(host.as_str()) || !is_page_like(&u) {
+            let Ok(mut u) = Url::parse(&l.href) else { continue };
+            // Сайт на www.8tm.by, а меню ссылается на 8tm.by/faq: та же страница — приводим к адресу
+            // сайта, иначе обход её пропускал (I09 «вопросов нет» при странице /faq в меню).
+            let bare = |h: &str| h.trim_start_matches("www.").to_string();
+            let Some(link_host) = u.host_str().map(str::to_string) else { continue };
+            if bare(&link_host) != bare(&host) || !is_page_like(&u) {
+                continue;
+            }
+            if link_host != host && u.set_host(Some(&host)).is_err() {
                 continue;
             }
             let n = normalize(&u);

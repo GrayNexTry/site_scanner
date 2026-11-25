@@ -141,6 +141,18 @@ pub fn score(results: &[MetricResult], business: &Business, discovery: Option<&D
             den += w;
         }
     }
+    // Сайта по факту нет (не открывается, заглушка, чужой домен): баллов разделов и общего балла нет —
+    // оценивать нечего, остаются только вердикт B01/F14 и карточка (раздел A).
+    let st0 = |id: &str| by_id.get(id).map(|r| r.status);
+    let val0 = |id: &str| by_id.get(id).and_then(|r| r.value.as_ref()).and_then(|v| v.as_str());
+    let no_site_really = st0("B01") == Some(Status::Fail)
+        || (st0("F14") == Some(Status::Fail) && val0("F14") == Some("home"))
+        || val0("H02") == Some("foreign");
+    if no_site_really {
+        for c in categories.iter_mut().filter(|(k, _)| k.as_str() != "A").map(|(_, c)| c) {
+            c.score = None;
+        }
+    }
     // Без проверенного сайта общего балла нет: одна карточка на карте — не оценка сайта.
     let site_measured = categories.iter().any(|(k, c)| k != "A" && c.score.is_some());
     let mut overall = (den > 0.0 && site_measured).then(|| (num / den).round());

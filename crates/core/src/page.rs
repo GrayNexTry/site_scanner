@@ -119,6 +119,9 @@ pub struct PageInfo {
     pub tel_links: Vec<String>,
     pub mailtos: Vec<String>,
     pub header_tel: bool,
+    /// В шапке (header, .header, .top-bar, #contact-info) есть номер телефона текстом — пусть и без tel:.
+    #[serde(default)]
+    pub header_phone_text: bool,
     pub hreflang: Vec<(String, String)>,
     pub breadcrumbs: bool,
     pub mixed_active: Vec<String>,
@@ -129,6 +132,11 @@ pub struct PageInfo {
     pub data_nosnippet: bool,
     /// Тексты кнопок и ссылок-кнопок (поиск CTA).
     pub buttons: Vec<String>,
+    /// Подписи и служебные строки, которые повторяются у каждого элемента списка: `<dt>`, `<th>`,
+    /// `<label>`, `<legend>`, `<caption>`, мета-строки статей («Информация о материале» у Joomla,
+    /// dentalsymphony.by ×59). Это не текст страницы — R11 их не считает.
+    #[serde(default)]
+    pub labels: Vec<String>,
     /// Текст, спрятанный приёмами скрытого текста: font-size:0, text-indent или позиция далеко
     /// за экраном (инлайн-стиль или правило в `<style>` по классу/id) — R12. Свёрнутые блоки
     /// (display:none у вкладок, спойлеров, попапов) сюда не входят: их посетитель может открыть.
@@ -217,6 +225,31 @@ fn is_hidden_field(el: &ElementRef) -> bool {
             || style.contains("visibility:hidden")
             || ["hidden", "honeypot", "hp-field", "invisible", "d-none"].iter().any(|c| class.contains(c))
     })
+}
+
+/// Сколько слов в data-nosnippet считается «закрытой частью текста» (меньше — служебные мелочи).
+const NOSNIPPET_MIN_WORDS: usize = 30;
+
+/// Элемент или любой его предок скрыт (hidden, aria-hidden, display:none, visibility:hidden).
+fn is_hidden_deep(el: &ElementRef) -> bool {
+    std::iter::once(*el).chain(el.ancestors().filter_map(ElementRef::wrap)).any(|e| {
+        let v = e.value();
+        let style = v.attr("style").unwrap_or("").to_ascii_lowercase().replace(' ', "");
+        v.attr("hidden").is_some() || v.attr("aria-hidden") == Some("true") || style.contains("display:none") || style.contains("visibility:hidden")
+    })
+}
+
+/// Слов в видимых блоках data-nosnippet (вложенные не считаются дважды; скрытые — не считаются:
+/// там обычно ошибки формы, а не контент страницы).
+fn visible_nosnippet_words(doc: &Html) -> usize {
+    let mut total = 0;
+    for el in doc.select(sel!("[data-nosnippet]")) {
+        if el.ancestors().filter_map(ElementRef::wrap).any(|a| a.value().attr("data-nosnippet").is_some()) || is_hidden_deep(&el) {
+            continue;
+        }
+        total += el_text(el).split_whitespace().filter(|w| w.chars().any(char::is_alphanumeric)).count();
+    }
+    total
 }
 
 fn has_label_ancestor(el: &ElementRef) -> bool {
@@ -327,6 +360,12 @@ pub fn extract(html: &str, page_url: &str) -> PageInfo {
         .filter_map(|e| attr(&e, "href").map(str::to_string))
         .collect();
     p.header_tel = !tel_header.is_empty();
+    p.header_phone_text = doc
+        .select(sel!(
+            "header, [class*='header'], [id*='header'], [class*='top-bar'], [class*='topbar'], [class*='top-line'], [id*='contact-info'], [class*='contact-info']"
+        ))
+        .take(12)
+        .any(|e| !crate::text::phones_in_text(&el_text(e)).is_empty());
     // Заготовки ссылок в <template> («/{{li_buttonlink@url}}» у карточек Tilda) браузер не показывает.
     let in_template = |e: &ElementRef| e.ancestors().filter_map(ElementRef::wrap).any(|a| a.value().name() == "template");
     for (i, a) in doc.select(sel!("a[href]")).filter(|a| !in_template(a) && !attr(a, "href").unwrap_or("").contains("{{")).enumerate() {
@@ -546,7 +585,7 @@ pub fn extract(html: &str, page_url: &str) -> PageInfo {
         .select(sel!("[class*='breadcrumb'], [id*='breadcrumb'], nav[aria-label*='readcrumb'], [itemtype*='BreadcrumbList']"))
         .next()
         .is_some();
-    p.data_nosnippet = doc.select(sel!("[data-nosnippet]")).next().is_some();
+    p.data_nosnippet = visible_nosnippet_words(&doc) >= NOSNIPPET_MIN_WORDS;
     if doc.select(sel!("time[datetime], [itemprop='author'], [rel='author']")).next().is_some() {
         p.article_meta = true;
     }
@@ -569,6 +608,14 @@ pub fn extract(html: &str, page_url: &str) -> PageInfo {
         let t = if b.value().name() == "input" { attr(&b, "value").unwrap_or("").to_string() } else { el_text(b) };
         if !t.is_empty() && t.chars().count() <= 60 {
             p.buttons.push(t);
+        }
+    }
+    for e in doc.select(sel!(
+        "dt, th, label, legend, caption, [class*='article-info'], [class*='entry-meta'], [class*='post-meta'], [class*='item-meta'], [class*='byline']"
+    )) {
+        let t = el_text(e);
+        if !t.is_empty() && t.chars().count() <= 80 {
+            p.labels.push(t);
         }
     }
 
@@ -852,5 +899,23 @@ mod noindex_tests {
         assert_eq!(p.invisible_iframes.len(), 1);
         let plain = super::extract("<html><head><meta http-equiv=refresh content=\"300\"></head><body>x</body></html>", "https://zub.ru/");
         assert!(plain.meta_refresh.is_none(), "обновление той же страницы раз в 5 минут — не перенаправление");
+    }
+}
+
+#[cfg(test)]
+mod nosnippet_tests {
+    #[test]
+    fn only_visible_long_nosnippet_counts() {
+        // minskdentist.by: data-nosnippet внутри скрытых ошибок формы — не закрытый текст.
+        let errs = (0..6).map(|_| r#"<div hidden><span data-nosnippet>Введите корректный номер телефона</span></div>"#).collect::<String>();
+        let html = format!(r#"<html><body><form>{errs}<div aria-hidden="true"><p data-nosnippet>Поле обязательно для заполнения</p></div></form></body></html>"#);
+        assert!(!super::extract(&html, "https://a.by/").data_nosnippet);
+        // Маленький видимый служебный блок — тоже нет.
+        let small = r#"<html><body><span data-nosnippet>Реклама</span></body></html>"#;
+        assert!(!super::extract(small, "https://a.by/").data_nosnippet);
+        // Видимый абзац на 40 слов — да.
+        let long = "слово ".repeat(40);
+        let big = format!(r#"<html><body><p data-nosnippet>{long}</p></body></html>"#);
+        assert!(super::extract(&big, "https://a.by/").data_nosnippet);
     }
 }

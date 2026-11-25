@@ -514,7 +514,8 @@ fn r11_keyword_spam(ctx: &CheckCtx, v: &SiteView) -> MetricResult {
         if LEGAL_PAGES.iter().any(|m| path.contains(m) || title.contains(m)) {
             continue;
         }
-        let exclude = format!("{} {}", p.links.iter().map(|l| l.text.as_str()).collect::<Vec<_>>().join(" "), p.buttons.join(" "))
+        // Ссылки, кнопки и подписи у каждого элемента списка («Информация о материале» ×59 у Joomla).
+        let exclude = format!("{} {} {}", p.links.iter().map(|l| l.text.as_str()).collect::<Vec<_>>().join(" "), p.buttons.join(" "), p.labels.join(" "))
             .to_lowercase()
             .replace('ё', "е");
         let Some((word, n, total)) = keyword_density(&p.text_lower(), &exclude, &own, &domain_label) else { continue };
@@ -535,10 +536,15 @@ fn r11_keyword_spam(ctx: &CheckCtx, v: &SiteView) -> MetricResult {
     };
     let pct = fmt_num((d * 1000.0).round() / 10.0);
     let detail = format!("«{word}…» — {pct} % ({n} из {total} слов) на {}", crate::text::truncate(&url, 70));
-    // Тема страницы повторяется естественно (страница о сертификате — «сертификат» 6 %);
-    // переспам — от 7 % и хотя бы 20 повторов.
-    let st = if d <= 0.05 { Status::Pass } else if d <= 0.07 || n < 20 { Status::Warn } else { Status::Fail };
-    let detail = if st == Status::Fail { format!("{detail}: похоже на SEO-текст, за такое Яндекс понижает") } else { detail };
+    // Тема страницы повторяется естественно: основа считает все формы слова («имплантация»,
+    // «импланты», «имплантационные» на странице об имплантации — 9 %, g-y.by). Переспам — от 10 %
+    // и хотя бы 25 повторов; между 5 и 10 % — «внимание» без приговора.
+    let st = if d <= 0.05 { Status::Pass } else if d <= 0.10 || n < 25 { Status::Warn } else { Status::Fail };
+    let detail = match st {
+        Status::Fail => format!("{detail}: похоже на SEO-текст, за такое Яндекс понижает"),
+        Status::Warn => format!("{detail}: слово повторяется часто — стоит перечитать текст"),
+        _ => detail,
+    };
     MetricResult::new("R11", st, detail).with_value((d * 1000.0).round() / 1000.0)
 }
 
@@ -680,8 +686,22 @@ fn r15_thin_pages(v: &SiteView) -> MetricResult {
         let path = url::Url::parse(u).map(|x| x.path().to_lowercase()).unwrap_or_default();
         crate::lexicon::UTILITY_SLUGS.iter().any(|s| path.contains(s))
     };
-    let eligible: Vec<(usize, &str)> =
-        v.pages.iter().zip(own.iter()).skip(1).filter(|(p, _)| !utility(&p.url) && !p.has_noindex()).map(|(p, n)| (*n, p.url.as_str())).collect();
+    // Прайс — список цен, а не страница без пользы (skydent.by /price/…: «Брекеты — 1 200 BYN»).
+    // Страница из раздела цен (/price/…, /ceny/…) или с тремя ценами и больше (skydent.by/price/ispravlenie-prikusa/:
+    // «Консультация — 30 BYN, брекеты — …»).
+    let price_list = |p: &crate::page::PageInfo| {
+        let path = url::Url::parse(&p.url).map(|u| u.path().to_lowercase()).unwrap_or_default();
+        ["/price", "/ceny", "/tseny", "/prais", "/prajs", "/stoimost", "/tarif", "/preise", "/prix", "/precios", "/cennik"].iter().any(|s| path.contains(s))
+            || crate::lexicon::price_re().find_iter(&p.text).take(3).count() >= 3
+    };
+    let eligible: Vec<(usize, &str)> = v
+        .pages
+        .iter()
+        .zip(own.iter())
+        .skip(1)
+        .filter(|(p, _)| !utility(&p.url) && !p.has_noindex() && !price_list(p))
+        .map(|(p, n)| (*n, p.url.as_str()))
+        .collect();
     if eligible.len() < 3 {
         return MetricResult::na("R15", "Страниц услуг и разделов среди обойдённых меньше трёх");
     }
@@ -782,6 +802,14 @@ mod tests {
         let brand = format!("{} {}", "салон mone на арбате ".repeat(25), "стрижка окрашивание маникюр педикюр ".repeat(10));
         let (w, _, _) = keyword_density(&brand, "", &HashSet::new(), "salonmone").unwrap();
         assert_ne!(w, "mone");
+        // Joomla: подпись «Информация о материале» у каждой статьи (dentalsymphony.by, 59 раз) —
+        // подписи из `<dt>` вычитаются, как ссылки и кнопки.
+        let label = "информация о материале";
+        let joomla = format!("{} {}", format!("{label} опубликовано 12.03.2024 ").repeat(30), "лечение кариеса и чистка зубов у врача ".repeat(10));
+        let labels = vec![label.to_string(); 30].join(" ");
+        let (w, _, _) = keyword_density(&joomla, &labels, &own, "").unwrap();
+        assert_ne!(w, "информ");
+        assert_ne!(w, "матери");
     }
 
     #[test]

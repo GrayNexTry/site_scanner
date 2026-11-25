@@ -1,9 +1,11 @@
 import { useEffect, useState } from "react";
+import { useLocation } from "react-router";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { api, type KeyState, type Settings } from "../api";
 import { useToast } from "../components";
+import { AiSettingsCard } from "./AiSettings";
 
-type KeyField = "google_places_key" | "yandex_geosearch_key" | "psi_key" | "safe_browsing_key" | "brave_search_key" | "yandex_search_key" | "proxy_url";
+type KeyField = "google_places_key" | "yandex_geosearch_key" | "psi_key" | "safe_browsing_key" | "brave_search_key" | "yandex_search_key" | "proxy_url" | "openrouter_key";
 
 const KEYS: { id: KeyField; label: string; how: string }[] = [
   { id: "google_places_key", label: "Google Places API (New)", how: "Google Cloud Console → APIs & Services → включить «Places API (New)» → Credentials → API key. Нужен платёжный аккаунт; бесплатный лимит есть." },
@@ -44,11 +46,18 @@ export default function SettingsPage() {
   const meta = useQuery({ queryKey: ["meta"], queryFn: api.meta, staleTime: 60_000 });
   const [keys, setKeys] = useState<Partial<Record<KeyField, string>>>({});
   const [limits, setLimits] = useState<Partial<Settings>>({});
+  const [priceTab, setPriceTab] = useState<string | null>(null);
   const proxyCheck = useMutation({ mutationFn: api.netViaProxy });
 
   useEffect(() => {
     if (q.data) setLimits(q.data);
   }, [q.data]);
+  // Ссылки «добавьте ключ в настройках» ведут сразу к разделу нейросети.
+  const { hash } = useLocation();
+  const loaded = !!q.data;
+  useEffect(() => {
+    if (hash === "#ai" && loaded) document.getElementById("ai")?.scrollIntoView({ block: "start" });
+  }, [hash, loaded]);
 
   const save = useMutation({
     mutationFn: () => {
@@ -67,6 +76,19 @@ export default function SettingsPage() {
         browser_path: limits.browser_path,
         proxy_always: limits.proxy_always,
         direct_network: limits.direct_network,
+        manager_name: limits.manager_name,
+        manager_email: limits.manager_email,
+        manager_phone: limits.manager_phone,
+        manager_telegram: limits.manager_telegram,
+        company_name: limits.company_name,
+        intro: limits.intro,
+        currency: limits.currency,
+        price_list: limits.price_list,
+        // Чужие валюты: сохраняем только строки с заданной ценой; пусто — сервер подставит ориентиры.
+        price_lists: Object.fromEntries(Object.entries(limits.price_lists ?? {}).map(([c, l]) => [c, l.filter((x) => x.price > 0)])),
+        ai_profiles: limits.ai_profiles,
+        ai_profile: limits.ai_profile,
+        ai_concurrency: limits.ai_concurrency,
       };
       for (const [k, v] of Object.entries(keys)) if (v !== undefined) patch[k] = v;
       return api.saveSettings(patch);
@@ -113,6 +135,124 @@ export default function SettingsPage() {
           save.mutate();
         }}
       >
+        <div className="card">
+          <div className="card-head"><h2>Профиль и подпись</h2></div>
+          <div className="card-pad stack" style={{ gap: 14 }}>
+            <p className="small muted">Подпись в первом сообщении и письме, контакты в коммерческом предложении и валюта цен.</p>
+            <div className="grid-2">
+            <div className="field">
+              <label htmlFor="manager_name">Ваше имя</label>
+              <input id="manager_name" className="input" placeholder="Например, Иван" value={limits.manager_name ?? ""} onChange={(e) => setLimits((l) => ({ ...l, manager_name: e.target.value }))} />
+            </div>
+            <div className="field">
+              <label htmlFor="manager_email">Почта</label>
+              <input id="manager_email" className="input" placeholder="" value={limits.manager_email ?? ""} onChange={(e) => setLimits((l) => ({ ...l, manager_email: e.target.value }))} />
+            </div>
+            <div className="field">
+              <label htmlFor="manager_phone">Телефон</label>
+              <input id="manager_phone" className="input" placeholder="+375…" value={limits.manager_phone ?? ""} onChange={(e) => setLimits((l) => ({ ...l, manager_phone: e.target.value }))} />
+            </div>
+            <div className="field">
+              <label htmlFor="manager_telegram">Telegram</label>
+              <input id="manager_telegram" className="input" placeholder="@ник" value={limits.manager_telegram ?? ""} onChange={(e) => setLimits((l) => ({ ...l, manager_telegram: e.target.value }))} />
+            </div>
+            <div className="field">
+              <label htmlFor="company_name">Компания или студия</label>
+              <input id="company_name" className="input" placeholder="необязательно" value={limits.company_name ?? ""} onChange={(e) => setLimits((l) => ({ ...l, company_name: e.target.value }))} />
+            </div>
+              <div className="field">
+                <label htmlFor="currency">Валюта цен</label>
+                <select id="currency" className="select" style={{ height: 34 }} value={limits.currency ?? "BYN"} onChange={(e) => setLimits((l) => ({ ...l, currency: e.target.value }))}>
+                  {(["BYN", "RUB", "USD", "EUR", "GBP", "PLN"].includes(limits.currency ?? "BYN") ? ["BYN", "RUB", "USD", "EUR", "GBP", "PLN"] : [limits.currency ?? "", "BYN", "RUB", "USD", "EUR", "GBP", "PLN"]).map((c) => <option key={c}>{c}</option>)}
+                </select>
+              </div>
+            </div>
+            <div className="field">
+              <label htmlFor="intro">Первая фраза сообщения</label>
+              <textarea id="intro" className="input" rows={2} placeholder="Пусто — фраза по категории компании («Я делаю сайты и SEO для клиник»)" value={limits.intro ?? ""} onChange={(e) => setLimits((l) => ({ ...l, intro: e.target.value }))} />
+            </div>
+          </div>
+        </div>
+        <div className="card">
+          <div className="card-head"><h2>Прайс</h2></div>
+          <div className="card-pad stack" style={{ gap: 10 }}>
+            <p className="small muted">Цены пакетов по умолчанию для плана работ и КП; в карточке компании их можно поправить. Выключенный пакет не предлагается заранее.</p>
+            {(() => {
+              const main = limits.currency ?? "BYN";
+              const tabs = [main, ...["GBP", "USD", "EUR"].filter((c) => c !== main)];
+              const tab = priceTab && tabs.includes(priceTab) ? priceTab : main;
+              const isMain = tab === main;
+              const own = limits.price_lists?.[tab] ?? [];
+              // Своего прайса нет — показываем пустые поля по шаблону основного.
+              const rows = isMain ? limits.price_list ?? [] : own.length ? own : (limits.price_list ?? []).map((x) => ({ ...x, price: 0 }));
+              const setRows = (f: (l: typeof rows) => typeof rows) =>
+                setLimits((l) =>
+                  isMain ? { ...l, price_list: f(l.price_list ?? []) } : { ...l, price_lists: { ...(l.price_lists ?? {}), [tab]: f(rows) } },
+                );
+              return (
+                <>
+                  <div className="row" role="tablist" aria-label="Валюта прайса">
+                    {tabs.map((c) => (
+                      <button key={c} type="button" role="tab" aria-selected={c === tab} className={`btn btn-sm${c === tab ? " btn-primary" : ""}`} onClick={() => setPriceTab(c)}>
+                        {c}{c === main ? " · основной" : (limits.price_lists?.[c] ?? []).some((x) => x.price > 0) ? "" : " · по умолчанию"}
+                      </button>
+                    ))}
+                  </div>
+                  {!isMain && (
+                    <p className="small muted">
+                      Свои цены для {tab} — для компаний из стран с этой валютой. Пустые поля: сервер подставит свои ориентиры; строка без цены в КП не попадёт.
+                    </p>
+                  )}
+                  <div className="table-wrap">
+                    <table className="table">
+                      <thead><tr><th>Пакет</th><th style={{ width: 130 }}>Цена, {tab}</th><th style={{ width: 90 }}>Включён</th></tr></thead>
+                      <tbody>
+                        {rows.map((it, i) => (
+                          <tr key={it.id}>
+                            <td>{it.title}</td>
+                            <td>
+                              <input
+                                className="input"
+                                type="number"
+                                min={0}
+                                placeholder={isMain ? undefined : "по умолчанию"}
+                                value={!isMain && !it.price ? "" : it.price}
+                                onChange={(e) => setRows((l) => l.map((x, j) => (j === i ? { ...x, price: Number(e.target.value) } : x)))}
+                                aria-label={`Цена ${tab}: ${it.title}`}
+                              />
+                            </td>
+                            <td>
+                              <input
+                                type="checkbox"
+                                checked={it.enabled}
+                                onChange={(e) => setRows((l) => l.map((x, j) => (j === i ? { ...x, enabled: e.target.checked } : x)))}
+                                aria-label={`Включён: ${it.title}`}
+                              />
+                            </td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </div>
+                </>
+              );
+            })()}
+          </div>
+        </div>
+        <AiSettingsCard
+          value={{ ai_profiles: limits.ai_profiles ?? [], ai_profile: limits.ai_profile ?? "", ai_concurrency: limits.ai_concurrency ?? 2 }}
+          onChange={(patch) => setLimits((l) => ({ ...l, ...patch }))}
+          keyInput={
+            <KeyInput
+              id="openrouter_key"
+              label="Ключ OpenRouter"
+              how="openrouter.ai → Keys → Create Key. Для бесплатных моделей пополнять счёт не нужно; лимит расходов можно задать прямо у ключа."
+              state={q.data.openrouter_key}
+              value={keys.openrouter_key}
+              onChange={(v) => setKeys((s) => ({ ...s, openrouter_key: v }))}
+            />
+          }
+        />
         <div className="card">
           <div className="card-head"><h2>Ключи API</h2></div>
           <div className="card-pad stack" style={{ gap: 18 }}>

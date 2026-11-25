@@ -9,6 +9,7 @@ import CatalogPage from "./pages/CatalogPage";
 import SettingsPage from "./pages/SettingsPage";
 import LeadsPage from "./pages/LeadsPage";
 import ReportPage from "./pages/ReportPage";
+import ProposalPage from "./pages/ProposalPage";
 
 function Logo() {
   return (
@@ -23,6 +24,7 @@ export default function App() {
   return (
     <Routes>
       <Route path="/report/:id" element={<ReportPage />} />
+      <Route path="/proposal/:id" element={<ProposalPage />} />
       <Route path="*" element={<Shell />} />
     </Routes>
   );

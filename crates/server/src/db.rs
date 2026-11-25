@@ -55,6 +55,30 @@ CREATE TABLE IF NOT EXISTS businesses (
     error        TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_businesses_scan ON businesses(scan_id);
+CREATE TABLE IF NOT EXISTS activities (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    business_id INTEGER NOT NULL REFERENCES businesses(id) ON DELETE CASCADE,
+    at          TEXT NOT NULL,
+    kind        TEXT NOT NULL,
+    channel     TEXT,
+    text        TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_activities_business ON activities(business_id);
+-- Сообщения клиентам: черновики нейросети, потом — отправленные и ответы (direction = 'in').
+CREATE TABLE IF NOT EXISTS messages (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    business_id INTEGER NOT NULL REFERENCES businesses(id) ON DELETE CASCADE,
+    created_at  TEXT NOT NULL,
+    updated_at  TEXT,
+    direction   TEXT NOT NULL DEFAULT 'out',
+    kind        TEXT NOT NULL,
+    status      TEXT NOT NULL DEFAULT 'draft',
+    subject     TEXT,
+    body        TEXT NOT NULL,
+    ai          TEXT,
+    sent_at     TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_messages_business ON messages(business_id);
 "#;
 
 /// Колонки, добавленные после первой версии схемы: (имя, определение).
@@ -65,6 +89,17 @@ const ADDED_COLUMNS: &[(&str, &str)] = &[
     ("notes", "TEXT"),
     ("status_at", "TEXT"),
     ("site_url", "TEXT"),
+    // Работа менеджера: цена сделки, следующий шаг, ЛПР, свои контакты, правки КП (JSON).
+    ("deal_price", "REAL"),
+    ("deal_currency", "TEXT"),
+    ("next_action_at", "TEXT"),
+    ("next_action", "TEXT"),
+    ("contact_person", "TEXT"),
+    ("extra_contacts", "TEXT"),
+    ("proposal", "TEXT"),
+    // Как клиент называет себя и свой адрес — для обращения, КП и отчёта (в карточках OSM белорусское или латинское написание).
+    ("display_name", "TEXT"),
+    ("display_address", "TEXT"),
 ];
 
 fn migrate(conn: &Connection) -> rusqlite::Result<()> {
@@ -80,7 +115,87 @@ fn migrate(conn: &Connection) -> rusqlite::Result<()> {
 }
 
 /// Статусы работы с лидом.
-pub const LEAD_STATUSES: &[&str] = &["new", "contacted", "talking", "client", "rejected", "skip"];
+pub const LEAD_STATUSES: &[&str] = &["new", "contacted", "talking", "proposal", "client", "rejected", "skip"];
+
+/// Название статуса для журнала касаний.
+pub fn status_label(s: &str) -> &'static str {
+    match s {
+        "contacted" => "Написали",
+        "talking" => "Переговоры",
+        "proposal" => "КП отправлено",
+        "client" => "Клиент",
+        "rejected" => "Отказ",
+        "skip" => "Не работаем",
+        _ => "Новый",
+    }
+}
+
+/// Виды касаний, которые добавляет менеджер; `status` и `price` пишет сервер.
+pub const ACTIVITY_KINDS: &[&str] = &["note", "message", "reply", "call", "meeting", "proposal"];
+pub const ACTIVITY_CHANNELS: &[&str] = &["instagram", "email", "phone", "telegram", "whatsapp", "viber", "vk", "facebook", "visit", "other"];
+
+/// Запись журнала касаний.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Activity {
+    pub id: i64,
+    pub business_id: i64,
+    pub at: String,
+    pub kind: String,
+    pub channel: Option<String>,
+    pub text: Option<String>,
+}
+
+/// Сообщение клиенту. `kind`: `email` (тема + письмо) или `short` (мессенджер); `status`: `draft`, `sent`;
+/// `ai` — как составлено: профиль, модель, запрос, ход рассуждения, токены, цена, замечания проверки.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Message {
+    pub id: i64,
+    pub business_id: i64,
+    pub created_at: String,
+    pub updated_at: Option<String>,
+    pub direction: String,
+    pub kind: String,
+    pub status: String,
+    pub subject: Option<String>,
+    pub body: String,
+    pub ai: Value,
+    pub sent_at: Option<String>,
+}
+
+const MESSAGE_COLS: &str = "id,business_id,created_at,updated_at,direction,kind,status,subject,body,ai,sent_at";
+
+fn message_row(r: &rusqlite::Row) -> rusqlite::Result<Message> {
+    Ok(Message {
+        id: r.get(0)?,
+        business_id: r.get(1)?,
+        created_at: r.get(2)?,
+        updated_at: r.get(3)?,
+        direction: r.get(4)?,
+        kind: r.get(5)?,
+        status: r.get(6)?,
+        subject: r.get(7)?,
+        body: r.get(8)?,
+        ai: r.get::<_, Option<String>>(9)?.and_then(|s| serde_json::from_str(&s).ok()).unwrap_or(Value::Null),
+        sent_at: r.get(10)?,
+    })
+}
+
+/// Правки полей работы с лидом. `None` — не трогать; пустая строка / `Some(None)` — очистить.
+#[derive(Debug, Default)]
+pub struct MetaPatch {
+    pub lead_status: Option<String>,
+    pub notes: Option<String>,
+    pub website_override: Option<String>,
+    pub deal_price: Option<Option<f64>>,
+    pub deal_currency: Option<String>,
+    pub next_action_at: Option<String>,
+    pub next_action: Option<String>,
+    pub contact_person: Option<String>,
+    pub extra_contacts: Option<Value>,
+    pub proposal: Option<Value>,
+    pub display_name: Option<String>,
+    pub display_address: Option<String>,
+}
 
 /// Пересчитанная оценка: id, лид, общий балл, приоритет, отчёт и — если результаты привели
 /// к новому каталогу — сами результаты.
@@ -143,9 +258,39 @@ pub struct BusinessRow {
     pub status_at: Option<String>,
     /// Адрес, который проверялся (из карточки, найденный или указанный вручную).
     pub site_url: Option<String>,
+    /// Цена сделки (итог КП), которую назначил менеджер.
+    pub deal_price: Option<f64>,
+    /// Валюта цены; пусто — валюта из настроек.
+    pub deal_currency: Option<String>,
+    /// Дата следующего шага, `YYYY-MM-DD`.
+    pub next_action_at: Option<String>,
+    pub next_action: Option<String>,
+    /// ЛПР: имя, должность.
+    pub contact_person: Option<String>,
+    /// Контакты, добавленные вручную: `[{kind, value, note?}]`.
+    pub extra_contacts: Value,
+    /// Сохранённые правки КП (не собранное КП: оно приходит отдельно в `proposal` ответа компании).
+    #[serde(skip_serializing_if = "Value::is_null")]
+    pub proposal: Value,
+    /// Название компании для документов клиенту, заданное вручную; пусто — из карточки.
+    pub display_name: Option<String>,
+    /// Адрес для документов клиенту, заданный вручную; пусто — из карточки.
+    pub display_address: Option<String>,
     /// Название скана — в общем списке лидов.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub scan_name: Option<String>,
+    /// Время последнего касания — в списке лидов.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_activity_at: Option<String>,
+    /// Есть ли у компании хоть один контакт (телефон, почта, мессенджер, соцсеть) — в списке лидов.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub has_contacts: Option<bool>,
+    /// Виды контактов без повторов (phone, email, instagram…) — значки каналов в таблице скана.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub contact_kinds: Option<Vec<String>>,
+    /// Первый телефон в международном виде — для шапки отчёта, КП и страницы компании.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub client_phone: Option<String>,
 }
 
 /// Какие компании скана брать.
@@ -158,6 +303,33 @@ pub enum Which {
 }
 
 impl BusinessRow {
+    /// Есть ли у компании контакты: карточки, сайт (если он принадлежит компании) и ручные.
+    /// `h02` — значение метрики H02 («foreign»/«unverified» — контакты сайта чужие).
+    pub fn contacts_of(&self, country: Option<&str>, h02: Option<&str>) -> Vec<scanner_core::sales::Contact> {
+        use scanner_core::mini::SiteState;
+        use scanner_core::sales::{contact_list, Contacts, ManualContact};
+        let card: scanner_core::Business = serde_json::from_value(self.data.clone()).unwrap_or_default();
+        let state: SiteState = serde_json::from_value(self.report["mini"]["state"].clone()).unwrap_or_default();
+        let trusted = !matches!(state, SiteState::Stub | SiteState::Dead) && !matches!(h02, Some("foreign" | "unverified"));
+        let site: Contacts = if trusted { serde_json::from_value(self.site["contacts"].clone()).unwrap_or_default() } else { Contacts::default() };
+        let manual: Vec<ManualContact> = serde_json::from_value(self.extra_contacts.clone()).unwrap_or_default();
+        contact_list(&card, &site, &manual, country)
+    }
+
+    /// Заполнить `has_contacts`, `contact_kinds` и `client_phone` по списку контактов.
+    pub fn set_contact_summary(&mut self, country: Option<&str>, h02: Option<&str>) {
+        let list = self.contacts_of(country, h02);
+        let mut kinds: Vec<String> = Vec::new();
+        for c in &list {
+            if !kinds.contains(&c.kind) {
+                kinds.push(c.kind.clone());
+            }
+        }
+        self.has_contacts = Some(!list.is_empty());
+        self.client_phone = scanner_core::sales::client_phone(&list, country);
+        self.contact_kinds = Some(kinds);
+    }
+
     /// Лёгкая строка для таблицы и событий: без исходных данных карточек и полного отчёта.
     /// У большого скана тысячи строк — полные весили бы десятки мегабайт.
     pub fn slim(mut self) -> Self {
@@ -170,7 +342,7 @@ impl BusinessRow {
             let m = &r["mini"];
             self.report = json!({
                 "lead_reasons": take(&r["lead_reasons"], 3),
-                "mini": {"state": m["state"], "headline": m["headline"], "problems": m["problems"], "offer": m["offer"]},
+                "mini": {"state": m["state"], "headline": m["headline"], "headline_en": m["headline_en"], "problems": m["problems"], "offer": m["offer"]},
             });
         }
         if !self.discovery.is_null() {
@@ -181,6 +353,7 @@ impl BusinessRow {
             self.site = json!({"final_url": x["final_url"], "error": x["error"], "status": x["status"], "via_proxy": x["via_proxy"]});
         }
         self.results = Value::Null;
+        self.proposal = Value::Null;
         self
     }
 }
@@ -573,11 +746,24 @@ impl Db {
             notes: r.get(25)?,
             status_at: r.get(26)?,
             site_url: r.get(27)?,
-            scan_name: r.get::<_, Option<String>>(28).ok().flatten(),
+            deal_price: r.get(28)?,
+            deal_currency: r.get(29)?,
+            next_action_at: r.get(30)?,
+            next_action: r.get(31)?,
+            contact_person: r.get(32)?,
+            extra_contacts: json_col(r.get(33)?),
+            proposal: json_col(r.get(34)?),
+            display_name: r.get(35)?,
+            display_address: r.get(36)?,
+            scan_name: r.get::<_, Option<String>>(37).ok().flatten(),
+            last_activity_at: r.get::<_, Option<String>>(38).ok().flatten(),
+            has_contacts: None,
+            contact_kinds: None,
+            client_phone: None,
         })
     }
 
-    const BIZ_COLS: &'static str = "id,scan_id,name,address,lat,lon,phone,website,category,rating,reviews,data,audit_status,lead,overall,priority,report,results,site,audited_at,audit_ms,error,discovery,website_override,lead_status,notes,status_at,site_url";
+    const BIZ_COLS: &'static str = "id,scan_id,name,address,lat,lon,phone,website,category,rating,reviews,data,audit_status,lead,overall,priority,report,results,site,audited_at,audit_ms,error,discovery,website_override,lead_status,notes,status_at,site_url,deal_price,deal_currency,next_action_at,next_action,contact_person,extra_contacts,proposal,display_name,display_address";
 
     /// Компании скана без результатов метрик; `slim` — ещё и без тяжёлых JSON (для таблицы).
     pub async fn list_businesses(&self, scan_id: i64, slim: bool) -> anyhow::Result<Vec<BusinessRow>> {
@@ -586,7 +772,27 @@ impl Db {
                 "SELECT {} FROM businesses WHERE scan_id=?1 ORDER BY COALESCE(priority,-1) DESC, name",
                 Self::BIZ_COLS.replace("results", "NULL")
             ))?;
-            st.query_map([scan_id], |r| Self::business_from_row(r, false).map(|b| if slim { b.slim() } else { b }))?.collect()
+            let mut rows = st.query_map([scan_id], |r| Self::business_from_row(r, false))?.collect::<rusqlite::Result<Vec<_>>>()?;
+            if slim {
+                // Контакты для таблицы скана — как в «Лидах»: карточка, сайт (если он компании) и ручные.
+                let country: Option<String> = c
+                    .query_row("SELECT params FROM scans WHERE id=?1", [scan_id], |r| r.get::<_, Option<String>>(0))
+                    .optional()?
+                    .flatten()
+                    .and_then(|p| serde_json::from_str::<Value>(&p).ok())
+                    .and_then(|p| p["country"].as_str().map(str::to_string));
+                // H02 нужен, только если у сайта есть сохранённые контакты: не разбирать результаты всех компаний.
+                let mut h02q = c.prepare(
+                    "SELECT json_extract(j.value, '$.value') FROM businesses b, json_each(b.results) j
+                     WHERE b.id=?1 AND json_extract(j.value, '$.id')='H02' LIMIT 1",
+                )?;
+                for row in &mut rows {
+                    let has_site_contacts = row.site["contacts"].as_object().is_some_and(|o| !o.is_empty());
+                    let h02: Option<String> = if has_site_contacts { h02q.query_row([row.id], |r| r.get(0)).optional()?.flatten() } else { None };
+                    row.set_contact_summary(country.as_deref(), h02.as_deref());
+                }
+            }
+            Ok(rows.into_iter().map(|b| if slim { b.slim() } else { b }).collect())
         })
         .await
     }
@@ -623,41 +829,205 @@ impl Db {
         self.call(move |c| c.execute("UPDATE businesses SET data=?2 WHERE id=?1", params![id, data.to_string()]).map(|_| ())).await
     }
 
-    pub async fn update_business_meta(
-        &self,
-        id: i64,
-        lead_status: Option<String>,
-        notes: Option<String>,
-        website_override: Option<String>,
-    ) -> anyhow::Result<bool> {
+    pub async fn update_business_meta(&self, id: i64, p: MetaPatch) -> anyhow::Result<bool> {
         self.call(move |c| {
             let mut n = 0;
-            if let Some(st) = lead_status {
+            let blank = |t: String| (!t.trim().is_empty()).then(|| t.trim().to_string());
+            if let Some(st) = p.lead_status {
                 n += c.execute("UPDATE businesses SET lead_status=?2, status_at=?3 WHERE id=?1", params![id, st, now()])?;
             }
-            if let Some(t) = notes {
+            if let Some(t) = p.notes {
                 let t = (!t.trim().is_empty()).then_some(t);
                 n += c.execute("UPDATE businesses SET notes=?2 WHERE id=?1", params![id, t])?;
             }
-            if let Some(w) = website_override {
-                let w = (!w.trim().is_empty()).then(|| w.trim().to_string());
-                n += c.execute("UPDATE businesses SET website_override=?2 WHERE id=?1", params![id, w])?;
+            if let Some(w) = p.website_override {
+                n += c.execute("UPDATE businesses SET website_override=?2 WHERE id=?1", params![id, blank(w)])?;
+            }
+            if let Some(v) = p.deal_price {
+                n += c.execute("UPDATE businesses SET deal_price=?2 WHERE id=?1", params![id, v])?;
+            }
+            if let Some(v) = p.deal_currency {
+                n += c.execute("UPDATE businesses SET deal_currency=?2 WHERE id=?1", params![id, blank(v)])?;
+            }
+            if let Some(v) = p.next_action_at {
+                n += c.execute("UPDATE businesses SET next_action_at=?2 WHERE id=?1", params![id, blank(v)])?;
+            }
+            if let Some(v) = p.next_action {
+                n += c.execute("UPDATE businesses SET next_action=?2 WHERE id=?1", params![id, blank(v)])?;
+            }
+            if let Some(v) = p.contact_person {
+                n += c.execute("UPDATE businesses SET contact_person=?2 WHERE id=?1", params![id, blank(v)])?;
+            }
+            if let Some(v) = p.extra_contacts {
+                let v = (!v.is_null()).then(|| v.to_string());
+                n += c.execute("UPDATE businesses SET extra_contacts=?2 WHERE id=?1", params![id, v])?;
+            }
+            if let Some(v) = p.proposal {
+                let v = (!v.is_null()).then(|| v.to_string());
+                n += c.execute("UPDATE businesses SET proposal=?2 WHERE id=?1", params![id, v])?;
+            }
+            if let Some(v) = p.display_name {
+                n += c.execute("UPDATE businesses SET display_name=?2 WHERE id=?1", params![id, blank(v)])?;
+            }
+            if let Some(v) = p.display_address {
+                n += c.execute("UPDATE businesses SET display_address=?2 WHERE id=?1", params![id, blank(v)])?;
             }
             Ok(n > 0)
         })
         .await
     }
 
-    /// Лиды из всех сканов, с которыми идёт работа (статус не «новый») или с заметками.
+    // ---------- журнал касаний ----------
+
+    pub async fn list_activities(&self, business_id: i64) -> anyhow::Result<Vec<Activity>> {
+        self.call(move |c| {
+            let mut st = c.prepare("SELECT id,business_id,at,kind,channel,text FROM activities WHERE business_id=?1 ORDER BY at DESC, id DESC")?;
+            st.query_map([business_id], |r| Ok(Activity { id: r.get(0)?, business_id: r.get(1)?, at: r.get(2)?, kind: r.get(3)?, channel: r.get(4)?, text: r.get(5)? }))?
+                .collect()
+        })
+        .await
+    }
+
+    pub async fn add_activity(&self, business_id: i64, kind: String, channel: Option<String>, text: Option<String>, at: Option<String>) -> anyhow::Result<Activity> {
+        self.call(move |c| {
+            let at = at.unwrap_or_else(now);
+            c.execute("INSERT INTO activities(business_id,at,kind,channel,text) VALUES(?1,?2,?3,?4,?5)", params![business_id, at, kind, channel, text])?;
+            Ok(Activity { id: c.last_insert_rowid(), business_id, at, kind, channel, text })
+        })
+        .await
+    }
+
+    /// Удалить запись журнала; возвращает компанию, которой она принадлежала.
+    pub async fn delete_activity(&self, id: i64) -> anyhow::Result<Option<i64>> {
+        self.call(move |c| {
+            let bid: Option<i64> = c.query_row("SELECT business_id FROM activities WHERE id=?1", [id], |r| r.get(0)).optional()?;
+            if bid.is_some() {
+                c.execute("DELETE FROM activities WHERE id=?1", [id])?;
+            }
+            Ok(bid)
+        })
+        .await
+    }
+
+    // ---------- сообщения ----------
+
+    pub async fn insert_message(&self, business_id: i64, kind: &'static str, subject: Option<String>, body: String, ai: Value) -> anyhow::Result<Message> {
+        self.call(move |c| {
+            let at = now();
+            c.execute(
+                "INSERT INTO messages(business_id,created_at,direction,kind,status,subject,body,ai) VALUES(?1,?2,'out',?3,'draft',?4,?5,?6)",
+                params![business_id, at, kind, subject, body, ai.to_string()],
+            )?;
+            let id = c.last_insert_rowid();
+            c.query_row(&format!("SELECT {MESSAGE_COLS} FROM messages WHERE id=?1"), [id], message_row)
+        })
+        .await
+    }
+
+    pub async fn list_messages(&self, business_id: i64) -> anyhow::Result<Vec<Message>> {
+        self.call(move |c| {
+            let mut st = c.prepare(&format!("SELECT {MESSAGE_COLS} FROM messages WHERE business_id=?1 ORDER BY created_at DESC, id DESC"))?;
+            st.query_map([business_id], message_row)?.collect()
+        })
+        .await
+    }
+
+    pub async fn get_message(&self, id: i64) -> anyhow::Result<Option<Message>> {
+        self.call(move |c| c.query_row(&format!("SELECT {MESSAGE_COLS} FROM messages WHERE id=?1"), [id], message_row).optional()).await
+    }
+
+    /// Правка текста или статуса; `sent` ставит и время отправки. None — сообщения нет.
+    pub async fn update_message(&self, id: i64, subject: Option<String>, body: Option<String>, status: Option<&'static str>) -> anyhow::Result<Option<Message>> {
+        self.call(move |c| {
+            let at = now();
+            let sent_at = (status == Some("sent")).then(|| at.clone());
+            let n = c.execute(
+                "UPDATE messages SET subject=COALESCE(?2,subject), body=COALESCE(?3,body), status=COALESCE(?4,status),
+                        sent_at=COALESCE(?5,sent_at), updated_at=?6 WHERE id=?1",
+                params![id, subject, body, status, sent_at, at],
+            )?;
+            if n == 0 {
+                return Ok(None);
+            }
+            c.query_row(&format!("SELECT {MESSAGE_COLS} FROM messages WHERE id=?1"), [id], message_row).optional()
+        })
+        .await
+    }
+
+    /// Удалить сообщение; возвращает компанию, которой оно принадлежало.
+    pub async fn delete_message(&self, id: i64) -> anyhow::Result<Option<i64>> {
+        self.call(move |c| {
+            let bid: Option<i64> = c.query_row("SELECT business_id FROM messages WHERE id=?1", [id], |r| r.get(0)).optional()?;
+            if bid.is_some() {
+                c.execute("DELETE FROM messages WHERE id=?1", [id])?;
+            }
+            Ok(bid)
+        })
+        .await
+    }
+
+    /// Компании из списка, у которых уже есть исходящее сообщение этого вида (черновик или отправленное).
+    pub async fn with_messages(&self, kind: &'static str, ids: Vec<i64>) -> anyhow::Result<std::collections::HashSet<i64>> {
+        self.call(move |c| {
+            let mut st = c.prepare("SELECT 1 FROM messages WHERE business_id=?1 AND kind=?2 AND direction='out' LIMIT 1")?;
+            let mut out = std::collections::HashSet::new();
+            for id in ids {
+                if st.exists(params![id, kind])? {
+                    out.insert(id);
+                }
+            }
+            Ok(out)
+        })
+        .await
+    }
+
+    /// Лиды из всех сканов: с которыми идёт работа (статус не «новый»), с заметками, ценой,
+    /// следующим шагом или касаниями.
     pub async fn list_leads(&self) -> anyhow::Result<Vec<BusinessRow>> {
         self.call(|c| {
             let cols = Self::BIZ_COLS.replace("results", "NULL").split(',').map(|x| format!("b.{x}")).collect::<Vec<_>>().join(",").replace("b.NULL", "NULL");
             let mut st = c.prepare(&format!(
-                "SELECT {cols}, s.name FROM businesses b JOIN scans s ON s.id=b.scan_id
+                "SELECT {cols}, s.name, (SELECT MAX(a.at) FROM activities a WHERE a.business_id=b.id) AS last_at, s.params,
+                        (SELECT json_extract(j.value, '$.value') FROM json_each(b.results) j WHERE json_extract(j.value, '$.id')='H02' LIMIT 1) AS h02
+                 FROM businesses b JOIN scans s ON s.id=b.scan_id
                  WHERE b.lead_status <> 'new' OR (b.notes IS NOT NULL AND b.notes <> '')
-                 ORDER BY COALESCE(b.status_at, b.audited_at) DESC LIMIT 2000"
+                    OR b.deal_price IS NOT NULL OR (b.next_action_at IS NOT NULL AND b.next_action_at <> '')
+                    OR (b.next_action IS NOT NULL AND b.next_action <> '')
+                    OR EXISTS (SELECT 1 FROM activities a WHERE a.business_id=b.id)
+                 ORDER BY MAX(COALESCE(last_at, ''), COALESCE(b.status_at, ''), COALESCE(b.audited_at, '')) DESC LIMIT 2000"
             ))?;
-            st.query_map([], |r| Self::business_from_row(r, false).map(BusinessRow::slim))?.collect()
+            st.query_map([], |r| {
+                let mut row = Self::business_from_row(r, false)?;
+                let params: Value = json_col(r.get(39)?);
+                let h02: Option<String> = r.get(40)?;
+                row.set_contact_summary(params["country"].as_str(), h02.as_deref());
+                Ok(row.slim())
+            })?
+            .collect()
+        })
+        .await
+    }
+
+    /// Дополнить строку сводкой по контактам (для события о компании: у таблицы скана те же значки, что в списке).
+    pub async fn with_contact_summary(&self, mut b: BusinessRow) -> anyhow::Result<BusinessRow> {
+        self.call(move |c| {
+            let country: Option<String> = c
+                .query_row("SELECT params FROM scans WHERE id=?1", [b.scan_id], |r| r.get::<_, Option<String>>(0))
+                .optional()?
+                .flatten()
+                .and_then(|p| serde_json::from_str::<Value>(&p).ok())
+                .and_then(|p| p["country"].as_str().map(str::to_string));
+            let h02: Option<String> = c
+                .query_row(
+                    "SELECT json_extract(j.value, '$.value') FROM businesses b, json_each(b.results) j
+                     WHERE b.id=?1 AND json_extract(j.value, '$.id')='H02' LIMIT 1",
+                    [b.id],
+                    |r| r.get(0),
+                )
+                .optional()?
+                .flatten();
+            b.set_contact_summary(country.as_deref(), h02.as_deref());
+            Ok(b)
         })
         .await
     }
@@ -690,12 +1060,25 @@ mod tests {
         assert_eq!(list.len(), 1);
         let bid = list[0].0;
         db.save_audit(bid, "hot".into(), Some(10.0), 320.0, serde_json::json!({}), serde_json::json!([]), serde_json::json!({}), 5, Value::Null, None).await.unwrap();
-        assert!(db.update_business_meta(bid, Some("contacted".into()), Some("позвонить в пятницу".into()), Some("https://x.ru".into())).await.unwrap());
+        assert!(db.update_business_meta(bid, MetaPatch { lead_status: Some("contacted".into()), notes: Some("позвонить в пятницу".into()), website_override: Some("https://x.ru".into()), ..Default::default() }).await.unwrap());
         let row = db.get_business(bid).await.unwrap().unwrap();
         assert_eq!((row.lead_status.as_str(), row.notes.as_deref(), row.website_override.as_deref()), ("contacted", Some("позвонить в пятницу"), Some("https://x.ru")));
         let leads = db.list_leads().await.unwrap();
         assert_eq!(leads.len(), 1);
         assert_eq!(leads[0].scan_name.as_deref(), Some("Тест"));
+        // Работа менеджера: цена, шаг, журнал; в лиды попадает и «новый» с ценой.
+        db.update_business_meta(bid, MetaPatch { deal_price: Some(Some(450.0)), next_action_at: Some("2026-12-01".into()), contact_person: Some("Анна, директор".into()), extra_contacts: Some(serde_json::json!([{"kind": "phone", "value": "+375 29 1"}])), ..Default::default() }).await.unwrap();
+        let a = db.add_activity(bid, "call".into(), Some("phone".into()), Some("не взяли трубку".into()), None).await.unwrap();
+        let row = db.get_business(bid).await.unwrap().unwrap();
+        assert_eq!((row.deal_price, row.next_action_at.as_deref(), row.contact_person.as_deref()), (Some(450.0), Some("2026-12-01"), Some("Анна, директор")));
+        assert_eq!(row.extra_contacts[0]["kind"], "phone");
+        let leads = db.list_leads().await.unwrap();
+        assert_eq!(leads[0].last_activity_at.as_deref(), Some(a.at.as_str()));
+        db.update_business_meta(bid, MetaPatch { deal_price: Some(None), ..Default::default() }).await.unwrap();
+        assert_eq!(db.get_business(bid).await.unwrap().unwrap().deal_price, None);
+        assert_eq!(db.list_activities(bid).await.unwrap().len(), 1);
+        assert_eq!(db.delete_activity(a.id).await.unwrap(), Some(bid));
+        assert!(db.list_activities(bid).await.unwrap().is_empty());
         db.refresh_progress(id).await.unwrap();
         let s = db.get_scan(id).await.unwrap().unwrap();
         assert_eq!(s.done, 1);

@@ -590,6 +590,35 @@ fn http_without_redirect_but_hsts_is_a_warning() {
     assert_eq!(result(&run(false), "B05").status, Status::Fail);
 }
 
+/// belodent.by через VPN: TLS-проба оборвана сервером («tls handshake eof»), а https-страница
+/// открылась со строгой проверкой. Это не «сайт без HTTPS», а HTTPS без перенаправления.
+#[test]
+fn tls_probe_cut_by_network_is_not_no_https() {
+    let html = "<html><head><title>Любимый стоматолог — Минск</title></head><body><h1>Стоматология</h1><p>Лечение зубов с микроскопом в Минске.</p></body></html>";
+    let run = |lenient: bool| {
+        run_page(html, &anon(), |s| {
+            s.home = Some(fetched("http://belodent.by/", html));
+            s.https_probe = Some(RedirectProbe {
+                url: "https://belodent.by/".into(),
+                first_status: Some(200),
+                final_url: Some("https://belodent.by/".into()),
+                final_status: Some(200),
+                hops: 0,
+                error: None,
+                hsts: false,
+            });
+            s.tls = Some(crate::tls::TlsInfo { valid: false, error: Some("tls handshake eof".into()), ..Default::default() });
+            s.tls_lenient = lenient;
+        })
+    };
+    let r = run(false);
+    let (b04, b05) = (result(&r, "B04"), result(&r, "B05"));
+    assert_eq!(b04.status, Status::NotMeasured, "{}", b04.detail);
+    assert_eq!(b05.value.as_ref().and_then(|v| v.as_str()), Some("no_redirect"), "{}", b05.detail);
+    // Страница открылась только без проверки сертификата — тут HTTPS как раз под вопросом.
+    assert_ne!(result(&run(true), "B04").status, Status::NotMeasured);
+}
+
 /// Лондон/Нью-Йорк: robots.txt закрывает только Яндекс — для страны вне его рынка это не стоп-фактор.
 #[test]
 fn yandex_block_outside_yandex_market_is_not_critical() {
@@ -650,4 +679,271 @@ fn belarusian_latin_without_diacritics_and_empty_jsonld() {
         <script type="application/ld+json">{"@context":"https://schema.org","@type":"Store","name":"Viking"}</script></head><body><h1>Vape</h1><p>Магазин.</p></body></html>"#;
     let r = run_page(html, &anon(), |_| {});
     assert_ne!(result(&r, "G04").status, Status::Fail, "{}", result(&r, "G04").detail);
+}
+
+/// Заглушка Hover (sysongraingercasting.com): «… is a totally awesome idea still being worked on» — сайта по факту нет;
+/// для такого сайта нет «в порядке» (кроме карточки) и баллов разделов.
+#[test]
+fn hover_placeholder_is_a_stub_without_ok_items_or_scores() {
+    let html = "<html><head><title>sysongraingercasting.com</title></head><body><p>sysongraingercasting.com is a totally awesome idea still being worked on. Check back later.</p></body></html>";
+    let r = run_page(html, &anon(), |_| {});
+    assert_eq!(result(&r, "B01").status, Status::Fail, "{}", result(&r, "B01").detail);
+    assert!(result(&r, "B01").detail.contains("заглушк"));
+    let passed: Vec<&str> = r.iter().filter(|x| x.status == Status::Pass && !x.id.starts_with('A')).map(|x| x.id.as_str()).collect();
+    assert!(passed.is_empty(), "у заглушки нет пунктов «в порядке»: {passed:?}");
+    let rep = crate::scoring::score(&r, &anon(), None);
+    assert_eq!(rep.overall, None);
+    assert!(rep.categories.iter().filter(|(k, _)| k.as_str() != "A").all(|(_, c)| c.score.is_none()), "баллов разделов нет");
+    assert_eq!(rep.mini.state, crate::mini::SiteState::Stub);
+}
+
+/// Адрес из карточки ведёт на страницу хостера с 404 («Сайт не обслуживается», magicart.by → start.hoster.by).
+#[test]
+fn hoster_page_with_404_is_a_stub() {
+    let html = "<html><head><title>Сайт не обслуживается</title></head><body><p>Сайт не обслуживается. start.hoster.by</p></body></html>";
+    let r = run_page(html, &anon(), |snap| {
+        if let Some(h) = snap.home.as_mut() {
+            h.status = 404;
+        }
+    });
+    assert_eq!(result(&r, "B01").status, Status::Fail);
+    assert!(result(&r, "B01").detail.contains("заглушка хостинга"), "{}", result(&r, "B01").detail);
+    assert_eq!(crate::scoring::score(&r, &anon(), None).mini.state, crate::mini::SiteState::Stub);
+}
+
+/// Страница без viewport-запрета и запрет масштабирования различаются значением E01.
+#[test]
+fn zoom_ban_is_not_missing_viewport() {
+    let html = r#"<html><head><title>Клиника</title><meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no"></head><body><h1>Клиника</h1><p>Лечение зубов, имплантация, протезирование и отбеливание в центре города, запись ежедневно с девяти до девяти.</p><a href="/price">Цены</a></body></html>"#;
+    let e01 = run_page(html, &anon(), |_| {}).into_iter().find(|x| x.id == "E01").unwrap();
+    assert_eq!(e01.status, Status::Warn);
+    assert_eq!(e01.value.as_ref().and_then(|v| v.as_str()), Some("no_zoom"));
+}
+
+/// Круг 6: belodent.by, stomatology.by, metamute.org, flamingobabybk.com — разметки нет совсем (G01),
+/// значит, G02, G03, G05 и прочие проверки её содержимого — «не измерено», а не провал.
+#[test]
+fn no_markup_at_all_leaves_markup_content_checks_not_measured() {
+    let html = "<html><head><title>Зуб-Мастер — стоматология</title></head><body><h1>Зуб-Мастер</h1><p>Лечение зубов. Телефон +7 495 123-45-67</p></body></html>";
+    let r = run_page(html, &business(), |_| {});
+    assert_eq!(result(&r, "G01").status, Status::Fail);
+    for id in ["G02", "G03", "G04", "G05", "G06", "G07", "G08"] {
+        assert_eq!(result(&r, id).status, Status::NotMeasured, "{id}: {}", result(&r, id).detail);
+        assert!(result(&r, id).detail.contains("G01"), "{id}: {}", result(&r, id).detail);
+    }
+}
+
+/// Круг 6: minskdentist.by — разметка есть, но только ImageObject: данных о компании в ней нет, G02 — провал.
+#[test]
+fn markup_without_company_data_still_fails_g02() {
+    let html = r#"<html><head><title>Зуб-Мастер — стоматология</title><script type="application/ld+json">{"@context":"https://schema.org","@type":"ImageObject","contentUrl":"https://zub.ru/a.jpg"}</script></head>
+        <body><h1>Зуб-Мастер</h1><p>Лечение зубов. Телефон +7 495 123-45-67</p></body></html>"#;
+    let r = run_page(html, &business(), |_| {});
+    assert_eq!(result(&r, "G01").status, Status::Pass);
+    assert_eq!(result(&r, "G02").status, Status::Fail, "{}", result(&r, "G02").detail);
+}
+
+/// Круг 6: flamingobabybk.com — без скриптов 155 слов из 700: это «часть текста», а не «пустая страница».
+#[test]
+fn i06_partial_text_is_not_an_empty_page() {
+    let words = |n: usize| (0..n).map(|i| format!("слово{i}")).collect::<Vec<_>>().join(" ");
+    let html = format!("<html><head><title>Зуб-Мастер</title></head><body><h1>Зуб-Мастер</h1><p>{}</p></body></html>", words(700));
+    let r = run_page(&html, &business(), |s| s.raw_words = Some(155));
+    let i06 = result(&r, "I06");
+    assert_eq!(i06.status, Status::Fail, "{}", i06.detail);
+    assert!(i06.detail.contains("видна только часть текста: 155 слов из"), "{}", i06.detail);
+    let r = run_page(&html, &business(), |s| s.raw_words = Some(60));
+    assert!(result(&r, "I06").detail.contains("почти пустую страницу"), "{}", result(&r, "I06").detail);
+}
+
+/// Страница с достаточным текстом, чтобы не принять её за заглушку.
+fn run_pad(html: &str, b: &Business, tweak: impl FnOnce(&mut SiteSnapshot)) -> Vec<MetricResult> {
+    let pad = format!("<p>{}</p></body>", "Лечение зубов, имплантация, протезирование, чистка и отбеливание в центре города, запись ежедневно. ".repeat(12));
+    run_page(&html.replace("</body>", &pad), b, tweak)
+}
+
+fn plain(r: &[MetricResult], id: &str, lang: &str) -> String {
+    crate::mini::plain_text_lang(result(r, id), lang)
+}
+
+/// 11303 и др.: в карточке часов нет — сверять не с чем (не «не совпадают» и не «совпадают»).
+#[test]
+fn h03_without_card_hours_is_not_measured() {
+    let html = "<html><head><title>Клиника</title></head><body><h1>Клиника</h1><p>Время работы: с 8:00 до 21:00 понедельник-пятница, суббота по графику.</p></body></html>";
+    let mut no_hours = business();
+    no_hours.sources[0].hours = None;
+    let r = run_pad(html, &no_hours, |_| {});
+    assert_eq!(result(&r, "H03").status, Status::NotMeasured, "{}", result(&r, "H03").detail);
+    assert!(result(&r, "H03").detail.contains("в карточке часы не указаны") || result(&r, "H03").detail.contains("В карточке часы не указаны"));
+    // Часы в карточке есть, на сайте записаны — совпадение; на сайте нет — предупреждение без слов «не совпадают».
+    { let r = run_pad(html, &anon(), |_| {}); assert_eq!(result(&r, "H03").status, Status::Pass, "{}", result(&r, "H03").detail); }
+    let bare = "<html><head><title>Клиника</title></head><body><h1>Клиника</h1><p>Лечение зубов в центре города.</p></body></html>";
+    let r = run_pad(bare, &anon(), |_| {});
+    assert_eq!(result(&r, "H03").status, Status::Warn);
+    assert!(!plain(&r, "H03", "ru").contains("не совпадают") && !plain(&r, "H03", "en").contains("don't match"));
+}
+
+/// Страница «О компании»: /company (minskdentist.by), кириллический и европейские адреса, текст ссылки «About».
+#[test]
+fn i10_about_page_addresses_in_many_languages() {
+    for (href, text) in [
+        ("/company", "Компания"),
+        ("/o-kompanii", "x"),
+        ("/o-klinike/", "x"),
+        ("/about-us", "x"),
+        ("/about", "x"),
+        ("/о-нас", "x"),
+        ("/uber-uns", "x"),
+        ("/a-propos", "x"),
+        ("/quienes-somos", "x"),
+        ("/chi-siamo", "x"),
+        ("/over-ons", "x"),
+        ("/sobre-nos", "x"),
+        ("/o-nas", "x"),
+        ("/page-17", "About"),
+        ("/page-18", "О клинике"),
+    ] {
+        let html = format!("<html><head><title>Клиника</title></head><body><h1>Клиника</h1><a href=\"{href}\">{text}</a></body></html>");
+        let r = run_pad(&html, &anon(), |_| {});
+        assert_eq!(result(&r, "I10").status, Status::Pass, "{href} {text}: {}", result(&r, "I10").detail);
+    }
+    let none = "<html><head><title>Клиника</title></head><body><h1>Клиника</h1><a href=\"/uslugi\">Услуги</a></body></html>";
+    assert_eq!(result(&run_pad(none, &anon(), |_| {}), "I10").status, Status::Warn);
+}
+
+/// «О компании» без ссылки в меню: факты (год, лицензия «№ …», команда) в тексте главной.
+#[test]
+fn i10_facts_in_text_count_without_about_link() {
+    let facts = "<html><head><title>Клиника</title></head><body><h1>Клиника</h1><p>Работаем с 2008 года. Лицензия № 02040/1234 выдана Минздравом. Наша команда — 12 врачей.</p></body></html>";
+    let r = run_pad(facts, &anon(), |_| {});
+    assert_eq!(result(&r, "I10").status, Status::Pass, "{}", result(&r, "I10").detail);
+    for t in [
+        "Established in 1999. Licence no. 445566. Meet the team.",
+        "Seit 1995 für Sie da. Unser Team besteht aus Zahnärzten. Lizenz Nr. 889900.",
+        "Depuis 2001. Notre équipe. SIRET 12345678900012.",
+        "Fundada en 2003. Nuestro equipo. Licencia nº 223344.",
+        "Dal 2000. Il nostro team. Licenza n. 556677.",
+        "Od 2005 roku. Nasz zespół. NIP 1234567890.",
+        "Sinds 1998. Ons team. Licentie nr. 778899.",
+        "Desde 2004. Nossa equipe. Licença nº 998877.",
+    ] {
+        assert!(super::content::company_facts(t).len() >= 2, "{t}: {:?}", super::content::company_facts(t));
+    }
+}
+
+/// stomatology.by: номер текстом в шапке без tel: — «не кликабелен», а не «телефона нет».
+#[test]
+fn n02_phone_text_in_header_is_not_missing() {
+    let html = r#"<html><head><title>Клиника</title></head><body><div id="contact-info"><span>(017) 276 74 26</span></div><h1>Клиника</h1><p>Лечение зубов.</p></body></html>"#;
+    let r = run_pad(html, &anon(), |_| {});
+    let n02 = result(&r, "N02");
+    assert_eq!(n02.status, Status::Warn, "{}", n02.detail);
+    assert!(plain(&r, "N02", "ru").contains("не нажимается"), "{}", plain(&r, "N02", "ru"));
+    let header = r#"<html><head><title>Clinic</title></head><body><header class="top-bar">Call +1 212 555 0100</header><h1>Clinic</h1></body></html>"#;
+    assert_eq!(result(&run_pad(header, &anon(), |_| {}), "N02").status, Status::Warn);
+    let nothing = r#"<html><head><title>Клиника</title></head><body><h1>Клиника</h1><p>Лечение зубов.</p></body></html>"#;
+    assert_eq!(result(&run_pad(nothing, &anon(), |_| {}), "N02").status, Status::Fail);
+}
+
+/// 11303: счётчиков нет — уведомление не требуется, это «не измерено», а не «Есть уведомление о cookie».
+#[test]
+fn m03_without_counters_is_not_required() {
+    let html = "<html><head><title>Клиника</title></head><body><h1>Клиника</h1><p>Мы используем cookie для работы сайта.</p></body></html>";
+    for country in ["by", "de", "us"] {
+        let snap = SiteSnapshot { input_url: "https://zub.ru/".into(), home: Some(fetched("https://zub.ru/", html)), page: Some(page::extract(html, "https://zub.ru/")), ..Default::default() };
+        let p = ScanParams { country: Some(country.into()), ..params() };
+        let r = run_all(&CheckCtx { business: &anon(), site: Some(&snap), params: &p, market: &MarketStats::default(), discovery: None });
+        let m03 = result(&r, "M03");
+        assert_eq!(m03.status, Status::NotMeasured, "{country}: {}", m03.detail);
+        assert!(m03.detail.contains("уведомление не требуется: счётчиков на сайте нет") || m03.detail.contains("Уведомление не требуется: счётчиков на сайте нет"), "{}", m03.detail);
+    }
+    // Счётчик есть, уведомления нет — по-прежнему предупреждение.
+    let with = "<html><head><title>Клиника</title><script src=\"https://mc.yandex.ru/metrika/tag.js\"></script></head><body><h1>Клиника</h1><p>Лечение.</p></body></html>";
+    assert_eq!(result(&run_pad(with, &anon(), |_| {}), "M03").status, Status::Warn);
+}
+
+fn bot(agent: &str, status: u16) -> BotProbe {
+    BotProbe { agent: agent.into(), status: Some(status), bytes: 10, challenge: false, error: None }
+}
+
+fn with_robots(body: &str, bots: Vec<BotProbe>) -> impl FnOnce(&mut SiteSnapshot) {
+    let body = body.to_string();
+    move |s: &mut SiteSnapshot| {
+        s.robots = Some(TextResource { url: "https://zub.ru/robots.txt".into(), status: Some(200), body: body.clone(), bytes: body.len(), error: None });
+        s.robots_directives = Some(robots::parse(&body));
+        s.bots = bots;
+    }
+}
+
+/// metamute.org: закрыты GPTBot, OAI-SearchBot, ClaudeBot → I02 только про поиск ChatGPT; ClaudeBot — I04.
+#[test]
+fn i02_counts_only_search_bots_training_goes_to_i04() {
+    let html = "<html><head><title>Mute</title></head><body><h1>Mute</h1><p>Журнал.</p></body></html>";
+    let body = "User-agent: GPTBot\nDisallow: /\n\nUser-agent: OAI-SearchBot\nDisallow: /\n\nUser-agent: ClaudeBot\nDisallow: /\n";
+    let r = run_pad(html, &anon(), with_robots(body, vec![]));
+    assert_eq!(result(&r, "I02").status, Status::Fail);
+    assert_eq!(plain(&r, "I02", "ru"), "Сайт закрыт для поиска ChatGPT настройками");
+    assert_eq!(plain(&r, "I02", "en"), "The site's settings block ChatGPT search");
+    assert!(!plain(&r, "I02", "ru").contains("Claude"));
+    assert_eq!(plain(&r, "I04", "ru"), "Сайт закрыт для обучения: ChatGPT и Claude");
+    // Только обучающие боты — поиск открыт.
+    let body = "User-agent: ClaudeBot\nDisallow: /\n\nUser-agent: Google-Extended\nDisallow: /\n\nUser-agent: CCBot\nDisallow: /\n";
+    let r = run_pad(html, &anon(), with_robots(body, vec![]));
+    assert_eq!(result(&r, "I02").status, Status::Pass, "{}", result(&r, "I02").detail);
+    assert_eq!(plain(&r, "I04", "ru"), "Сайт закрыт для обучения: Claude, Gemini и Common Crawl");
+    // Бот по запросу пользователя — «внимание».
+    let body = "User-agent: ChatGPT-User\nDisallow: /\n";
+    let r = run_pad(html, &anon(), with_robots(body, vec![]));
+    assert_eq!(result(&r, "I02").status, Status::Warn);
+}
+
+/// stomatology.by: PerplexityBot 490 — защита режет бота, I05 «внимание»; закрытый в robots бот — не I05.
+#[test]
+fn i05_nonstandard_block_status_and_robots_closed_bots() {
+    let html = "<html><head><title>Клиника</title></head><body><h1>Клиника</h1><p>Лечение зубов.</p></body></html>";
+    let probes = || vec![bot("OAI-SearchBot", 200), bot("PerplexityBot", 490), bot("Claude-SearchBot", 200)];
+    let r = run_pad(html, &anon(), with_robots("User-agent: *\nAllow: /\n", probes()));
+    assert_eq!(result(&r, "I05").status, Status::Warn, "{}", result(&r, "I05").detail);
+    assert!(result(&r, "I05").detail.contains("PerplexityBot (490)"));
+    // Тот же бот закрыт robots — отказ защиты не считаем: это I02.
+    let r = run_pad(html, &anon(), with_robots("User-agent: PerplexityBot\nDisallow: /\n", probes()));
+    assert_eq!(result(&r, "I05").status, Status::Pass, "{}", result(&r, "I05").detail);
+    assert_eq!(result(&r, "I02").status, Status::Fail);
+}
+
+fn crawled(url: &str, html: &str) -> crate::site::CrawledPage {
+    crate::site::CrawledPage { url: url.into(), final_url: url.into(), depth: 1, status: Some(200), redirected: false, error: None, bytes: html.len(), info: Some(page::extract(html, url)) }
+}
+
+/// C25 и C14 по факту: 4 из 14 с параметрами — «у части страниц», повторы только заголовков — без «описаний».
+#[test]
+fn c25_and_c14_are_worded_by_fact() {
+    let page_html = |t: &str| format!("<html><head><title>{t}</title></head><body><h1>{t}</h1><p>Текст страницы про лечение зубов в клинике.</p></body></html>");
+    let same = page_html("Клиника — Минск");
+    let r = run_pad(&same, &anon(), |s| {
+        s.pages = (0..14).map(|i| crawled(&if i < 4 { format!("https://zub.ru/p?id={i}") } else { format!("https://zub.ru/p{i}/") }, &same)).collect();
+    });
+    let c25 = result(&r, "C25");
+    assert_eq!(c25.status, Status::Warn, "{}", c25.detail);
+    assert_eq!(plain(&r, "C25", "ru"), "У части страниц (4 из 14) адреса с параметрами");
+    assert_eq!(plain(&r, "C25", "en"), "Some pages (4 of 14) have addresses with parameters");
+    let c14 = plain(&r, "C14", "ru");
+    assert!(c14.starts_with("Одинаковые заголовки у ") && !c14.contains("описания"), "{c14}");
+    assert!(plain(&r, "C14", "en").contains("page titles") && !plain(&r, "C14", "en").contains("descriptions"));
+    // Большинство адресов с параметрами — тогда «нечитаемые».
+    let r = run_pad(&same, &anon(), |s| {
+        s.pages = (0..9).map(|i| crawled(&format!("https://zub.ru/index.php?id={i}"), &page_html(&format!("Страница {i}")))).collect();
+    });
+    assert!(plain(&r, "C25", "ru").contains("нечитаемые"), "{}", plain(&r, "C25", "ru"));
+}
+
+/// Источники только из открытых данных: клиентские формулировки раздела A называют карту.
+#[test]
+fn open_maps_label_names_only_open_sources() {
+    let with = |ps: &[ProviderKind]| Business { sources: ps.iter().map(|p| Place { provider: Some(*p), ..Default::default() }).collect(), ..Default::default() };
+    assert_eq!(open_maps_label(&with(&[ProviderKind::Osm, ProviderKind::Overture])).as_deref(), Some("OpenStreetMap"));
+    assert_eq!(open_maps_label(&with(&[ProviderKind::Overture])).as_deref(), Some("Overture Maps"));
+    assert_eq!(open_maps_label(&with(&[ProviderKind::Osm, ProviderKind::Google])), None);
+    assert_eq!(open_maps_label(&with(&[ProviderKind::Yandex])), None);
+    assert_eq!(open_maps_label(&with(&[ProviderKind::Manual])), None);
 }

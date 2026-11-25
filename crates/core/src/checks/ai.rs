@@ -44,6 +44,18 @@ fn short_url(u: &str) -> String {
 
 // ---------- I17: видимая дата обновления ----------
 
+/// Дата этого года на странице: «13.11.2026», «2026-11-13», «13 ноября 2026», «13 November 2026».
+fn fresh_date(p: &PageInfo, now_year: i32) -> Option<String> {
+    static DATE: OnceLock<Regex> = OnceLock::new();
+    let re = DATE.get_or_init(|| {
+        Regex::new(r"(?i)\b(?:\d{1,2}[./]\d{1,2}[./](\d{4})|(\d{4})-\d{2}-\d{2}|\d{1,2}\s+[a-zа-яё]{3,10}\.?\s+(\d{4}))\b").unwrap()
+    });
+    re.captures_iter(&p.text).find_map(|c| {
+        let y: i32 = c.get(1).or(c.get(2)).or(c.get(3))?.as_str().parse().ok()?;
+        (y == now_year).then(|| c.get(0).map(|m| m.as_str().to_string())).flatten()
+    })
+}
+
 fn updated_date(v: &SiteView, key: &[&PageInfo]) -> MetricResult {
     static YEAR: OnceLock<Regex> = OnceLock::new();
     let year_re = YEAR.get_or_init(|| Regex::new(r"(?:19|20)\d{2}|[./-](\d{2})$").unwrap());
@@ -63,6 +75,15 @@ fn updated_date(v: &SiteView, key: &[&PageInfo]) -> MetricResult {
             MetricResult::warn("I17", format!("Дата обновления давняя: «{}» ({page}) — ИИ предпочитает свежие источники", crate::text::truncate(&s, 60)))
         }
         Some((page, s, _)) => MetricResult::pass("I17", format!("Дата обновления видна: «{}» ({page})", crate::text::truncate(&s, 60))),
+        // Подписи «обновлено» нет, но на главной свежие даты (лента новостей с датами этого года,
+        // 7gsp.by: «13.11.2026») — видно, что сайт живой.
+        None if fresh_date(v.page, v.now_year).is_some() => MetricResult::warn(
+            "I17",
+            format!(
+                "Подписи «обновлено» нет, но на главной свежие даты («{}», новости) — для цен и услуг дату обновления стоит писать отдельно",
+                fresh_date(v.page, v.now_year).unwrap_or_default()
+            ),
+        ),
         None if markup => MetricResult::warn("I17", "Дата обновления есть только в разметке (dateModified), на странице её не видно"),
         None => MetricResult::fail("I17", format!("Даты обновления не видно ни на главной, ни на страницах услуг ({} стр.)", key.len())),
     }
@@ -142,6 +163,9 @@ fn answer_first(ctx: &CheckCtx, v: &SiteView, key: &[&PageInfo]) -> MetricResult
         MetricResult::warn("I18", format!("В начале страницы ни места (город, район, улица), ни цифр (цена, срок, опыт): «{}»{inner_note}", home.snippet))
     } else if inner_good * 2 >= inner.len().max(1) && !inner.is_empty() {
         MetricResult::warn("I18", format!("На главной после H1 почти нет текста ({} слов), на страницах услуг есть{inner_note}", home.words))
+    } else if home.specific && home.words >= 12 {
+        // Коротко, но по делу: адрес, телефоны, тип учреждения (7gsp.by, 23 слова) — цитировать есть что.
+        MetricResult::warn("I18", format!("После H1 коротко ({} слов), но с конкретикой: «{}» — стоит добавить 2–3 предложения об услугах{inner_note}", home.words, home.snippet))
     } else {
         MetricResult::fail("I18", format!("После H1 всего {} слов текста — ИИ нечего процитировать с первого экрана{inner_note}", home.words))
     }

@@ -8,6 +8,7 @@ use serde_json::Value;
 
 use super::{list_short, CheckCtx, SiteView};
 use crate::model::{MetricResult, Status};
+use crate::page::PageInfo;
 use crate::robots;
 use crate::text::{phone_key, phones_in_text, stems};
 
@@ -270,6 +271,13 @@ pub fn run(ctx: &CheckCtx, v: &SiteView, out: &mut Vec<MetricResult>) {
         (p, a) if p != Some(true) && a != Some(true) && (gambling_hijack(&b.name, b.category.as_deref(), text, page.title.as_deref()) || (mostly_cjk(text) && !asian_locale(&v.final_url) && !crate::region::cjk_country(ctx.params.country.as_deref()))) => {
             MetricResult::fail("H02", "На сайте чужое содержимое (казино, ставки или текст на другом языке) — домен, похоже, перехвачен или продан").with_value("foreign")
         }
+        // Сверить не с чем, а названия компании на сайте не видно (luxtour.by у «Пончыкі» — туры в
+        // Египет): не «чужой» наверняка, но отчёт с «сайт в порядке» отправлять нельзя — проверить.
+        (None, None) if !name_on_site(&b.name, text, page.title.as_deref(), &domain_label) => MetricResult::warn(
+            "H02",
+            "В карточке нет телефона и адреса, а названия компании на сайте не видно — проверить, её ли это сайт",
+        )
+        .with_value("unverified"),
         (None, None) => MetricResult::na("H02", "В карточке нет телефона и адреса"),
         (Some(true), Some(true)) | (Some(true), None) | (None, Some(true)) => MetricResult::pass("H02", "Контакты сайта совпадают с карточкой"),
         (Some(false), Some(false)) if card_phone.as_ref().is_some_and(|k| crate::discover::raw_phone_keys(&v.home.body).contains(k)) => {
@@ -299,10 +307,13 @@ pub fn run(ctx: &CheckCtx, v: &SiteView, out: &mut Vec<MetricResult>) {
         }
         (_, Some(false)) => MetricResult::warn("H02", "Адреса из карточки на сайте нет"),
     });
-    out.push(if crate::lexicon::hours_re().is_match(text) {
-        MetricResult::pass("H03", "Часы работы на сайте указаны (сверка с картой — вручную)")
-    } else {
-        MetricResult::warn("H03", "Часов работы на сайте не найдено")
+    let card_hours = b.sources.iter().any(|s| s.hours.as_deref().is_some_and(|h| !h.trim().is_empty()));
+    let site_hours = crate::lexicon::hours_re().is_match(text);
+    out.push(match (card_hours, site_hours) {
+        // Сверять не с чем: часов нет в карточке — это не «совпадают» и не «не совпадают».
+        (false, _) => MetricResult::na("H03", if site_hours { "В карточке часы не указаны — сверить не с чем (на сайте часы есть)" } else { "В карточке часы не указаны — сверить не с чем" }),
+        (true, true) => MetricResult::pass("H03", "Часы работы на сайте указаны (сверка с картой — вручную)"),
+        (true, false) => MetricResult::warn("H03", "Часов работы на сайте не найдено, а в карточке они есть"),
     });
     let html = &v.html_all;
     let map_widget = crate::lexicon::MAP_WIDGETS.iter().any(|m| html.contains(m));
@@ -405,10 +416,17 @@ fn be_latin_to_cyr(s: &str) -> String {
 fn name_on_site(name: &str, text: &str, title: Option<&str>, domain_label: &str) -> bool {
     use crate::discover::translit_city as lat;
     let norm = |s: &str| crate::text::fold_diacritics(&be_to_ru(&s.to_lowercase().replace('ё', "е")).replace('о', "а"));
-    let tokens: Vec<String> = crate::text::normalize_name(name).split_whitespace().filter(|w| w.chars().count() >= 4).map(norm).collect();
-    if tokens.is_empty() {
+    let all: Vec<String> = crate::text::normalize_name(name).split_whitespace().filter(|w| w.chars().count() >= 4).map(norm).collect();
+    if all.is_empty() {
         return true;
     }
+    // Общие слова названия («туры», «мастерская», «клиника») есть на любом сайте отрасли — по ним
+    // свой сайт не узнать (travelnews.by у «Мои Любимые Туры», ikona-skiniya.com у «Творческая
+    // Мастерская Ирины Паньковой»). Сверяем отличительные слова, а если их нет — все.
+    let generic = |t: &str| crate::discover::GENERIC.iter().chain(NAME_GENERIC).any(|g| norm(g) == t);
+    let distinct: Vec<String> = all.iter().filter(|t| !generic(t)).cloned().collect();
+    let tokens = if distinct.is_empty() { all } else { distinct };
+    let multi = tokens.len() >= 2;
     let hay = norm(&format!("{} {}", title.unwrap_or(""), text));
     if tokens.iter().any(|t| hay.contains(t.as_str())) {
         return true;
@@ -426,11 +444,14 @@ fn name_on_site(name: &str, text: &str, title: Option<&str>, domain_label: &str)
     let label = domain_label.to_lowercase().replace('o', "a");
     let name_is_domain = name.to_lowercase().replace('o', "a").contains(&format!("{label}."));
     let prefix = |a: &str, b: &str| a.chars().zip(b.chars()).take_while(|(x, y)| x == y).count();
+    // В названии два отличительных слова и больше — одного совпавшего слова в домене мало
+    // (zolotoi.by у «La Crête D'Or (Золотой Гребешок)» — сайт японских обоев).
+    let label_hits = toks.iter().filter(|t| label.contains(t.as_str()) || t.contains(label.as_str())).count();
     if label.len() >= 4
         && !name_is_domain
-        && (toks.iter().any(|t| label.contains(t.as_str()) || t.contains(label.as_str()))
-            || prefix(&label, &compact_name) >= 5
-            || compact_name.contains(&label)
+        && (label_hits >= if multi { 2 } else { 1 }
+            || prefix(&label, &compact_name) >= if multi { 8 } else { 5 }
+            || (compact_name.contains(&label) && (!multi || label.len() >= 8))
             || (label.len() >= 6 && similar(&label, &compact_name) >= 0.55))
     {
         return true;
@@ -439,14 +460,25 @@ fn name_on_site(name: &str, text: &str, title: Option<&str>, domain_label: &str)
     toks.iter().any(|t| hay_words.iter().any(|w| w.len().abs_diff(t.len()) <= 2 && similar(w, t) >= 0.7))
 }
 
+/// Слова названий, которые есть на любом сайте отрасли (в дополнение к `discover::GENERIC`).
+const NAME_GENERIC: &[&str] = &[
+    "туры", "туров", "турагентство", "турфирма", "tours", "travel", "творческая", "агентство", "компания", "фирма", "ателье",
+    "школа", "курсы", "клуб", "club", "school", "academy", "академия", "бюро", "кофейня", "coffee", "пиццерия", "пекарня",
+    "отель", "гостиница", "hotel", "хостел", "hostel", "аптека", "оптика", "цветы", "flowers", "ремонт", "мебель", "маникюр",
+    "массаж", "фитнес", "fitness", "йога", "yoga", "танцы", "dance", "фото", "photo", "печать", "print", "доставка", "delivery",
+    "минск", "minsk", "беларусь", "belarus", "москва", "moscow", "london", "paris", "berlin", "madrid",
+];
+
 /// Домен перехвачен под азартные игры: на странице казино и ставки, а компания к ним отношения не имеет.
-fn gambling_hijack(name: &str, category: Option<&str>, text: &str, title: Option<&str>) -> bool {
+pub fn gambling_hijack(name: &str, category: Option<&str>, text: &str, title: Option<&str>) -> bool {
     const WORDS: &[&str] = &[
         "казино", "casino", "ставки", "букмекер", "слоты", "online slots", "slot machine", "1xbet", "фриспин", "покер", "poker", "рабочее зеркало",
         "фрибет", "коэффициенты", "беттинг", "betting", "игровые автоматы", "джекпот", "jackpot", "вейджер", "прогнозы на спорт",
         "бонус за регистрацию", "sportsbook", "bookmaker", "free spins", "no deposit bonus", "paris sportifs", "machines à sous",
         "apuestas", "tragamonedas", "tragaperras", "sportwetten", "spielautomaten", "freispiele", "wettanbieter", "scommesse",
         "giri gratis", "bukmacher", "zakłady", "automaty do gier", "apostas", "caça-níqueis", "gokken", "weddenschappen",
+        // Индонезийский слот-спам на взломанных сайтах (Mother Dough: HAMTOTO, 7th Avenue Wine: JOS129 «gacor»).
+        "gacor", "togel", "maxwin", "situs slot", "slot online", "judi online", "rtp live", "rtp slot", "slot88", "scatter hitam",
     ];
     let own = format!("{} {}", name, category.unwrap_or("")).to_lowercase();
     if WORDS.iter().any(|w| own.contains(w)) {
@@ -538,7 +570,40 @@ pub fn address_matches(addr: &str, text: &str) -> bool {
     // Белорусская латиница в карточке («vulica Uĺjanaŭskaja 29») — второй попыткой в кириллице;
     // польские, чешские, литовские адреса с теми же буквами сверяем как есть.
     let be = be_latin_to_cyr(addr);
-    address_matches_one(addr, text) || (be != addr && address_matches_one(&be, text))
+    // Русская транслитерация (Overture: «Ulitsa L'va Sapegi 9» ↔ «ул. Льва Сапеги, дом 9») — третьей.
+    let ru = ru_latin_to_cyr(addr);
+    address_matches_one(addr, text) || (be != addr && address_matches_one(&be, text)) || (ru != addr && address_matches_one(&ru, text))
+}
+
+/// Русская латиница (ГОСТ/BGN, как в Overture и Google) → кириллица. Только если в адресе есть
+/// русское слово улицы: «Ulitsa», «Prospekt», «Pereulok»… — иначе латинский адрес не трогаем.
+fn ru_latin_to_cyr(s: &str) -> String {
+    let low = s.to_lowercase();
+    const STREET: &[&str] = &["ulitsa", "ulitca", "prospekt", "pereulok", "ploshchad", "shosse", "bulvar", "naberezhnaya", "proyezd", "proezd", "tupik", "mikrorayon"];
+    if !STREET.iter().any(|w| low.contains(w)) {
+        return s.to_string();
+    }
+    const PAIRS: &[(&str, &str)] = &[
+        ("shch", "щ"), ("sch", "щ"), ("sh", "ш"), ("ch", "ч"), ("zh", "ж"), ("kh", "х"), ("ts", "ц"), ("ya", "я"), ("yu", "ю"),
+        ("yo", "е"), ("ye", "е"), ("iy", "ий"), ("yy", "ый"), ("'", "ь"), ("’", "ь"), ("a", "а"), ("b", "б"), ("v", "в"), ("g", "г"),
+        ("d", "д"), ("e", "е"), ("z", "з"), ("i", "и"), ("y", "ы"), ("j", "й"), ("k", "к"), ("l", "л"), ("m", "м"), ("n", "н"),
+        ("o", "о"), ("p", "п"), ("r", "р"), ("s", "с"), ("t", "т"), ("u", "у"), ("f", "ф"), ("h", "х"), ("c", "ц"),
+    ];
+    let mut out = String::new();
+    let mut rest = low.as_str();
+    'outer: while !rest.is_empty() {
+        for (lat, cyr) in PAIRS {
+            if let Some(r) = rest.strip_prefix(lat) {
+                out.push_str(cyr);
+                rest = r;
+                continue 'outer;
+            }
+        }
+        let c = rest.chars().next().unwrap();
+        out.push(c);
+        rest = &rest[c.len_utf8()..];
+    }
+    out
 }
 
 fn address_matches_one(addr: &str, text: &str) -> bool {
@@ -590,7 +655,52 @@ fn address_matches_one(addr: &str, text: &str) -> bool {
         };
         contains_word(&text, h) || (digits.len() < h.chars().count() && !digits.is_empty() && digits_ok())
     };
-    text.contains(&stem) && house.is_none_or(|h| house_ok(&h))
+    (text.contains(&stem) && house.as_deref().is_none_or(house_ok)) || house.as_deref().is_some_and(|h| street_near_house(&street, h, &text))
+}
+
+/// Костяк кириллического слова — согласные без повторов: белорусское и русское написание одной
+/// улицы расходятся в гласных (ы/и, я/е, а/о, і/и), в «дз»/«д», «ц»/«т», «шч»/«щ», ў/в, а согласные
+/// совпадают: «Прытыцкага» и «Притыцкого» → «прткг», «Дзяржынскага» и «Дзержинского» → «држнскг».
+fn consonant_skeleton(w: &str) -> String {
+    let w = w.replace("дз", "д").replace("шч", "щ").replace('ц', "т").replace('ў', "в");
+    let mut out = String::new();
+    for c in w.chars().filter(|c| c.is_alphabetic() && !"аеёиіоуыэюяьъй".contains(*c)) {
+        if !out.ends_with(c) {
+            out.push(c);
+        }
+    }
+    out
+}
+
+/// Запасное сравнение кириллической улицы по костяку согласных — без словаря, для любых улиц.
+/// Слабее точного, поэтому номер дома обязан быть первым числом после улицы, а в костяке —
+/// не меньше трёх согласных.
+fn street_near_house(street: &str, house: &str, text: &str) -> bool {
+    if !street.chars().any(|c| matches!(c, 'а'..='я' | 'ё' | 'і' | 'ў')) {
+        return false;
+    }
+    let sk = consonant_skeleton(street);
+    let digits: String = house.chars().take_while(|c| c.is_ascii_digit()).collect();
+    if sk.chars().count() < 3 || digits.is_empty() {
+        return false;
+    }
+    // Первое число после улицы (не дальше 20 знаков: «, д. 39», « 39а») — номер дома.
+    let house_after = |from: usize| {
+        let first: String = text[from..].chars().take(20).skip_while(|c| !c.is_ascii_digit()).take_while(char::is_ascii_digit).collect();
+        first == digits
+    };
+    let mut start = None;
+    for (i, c) in text.char_indices().chain(std::iter::once((text.len(), ' '))) {
+        if c.is_alphanumeric() {
+            start.get_or_insert(i);
+        } else if let Some(s) = start.take()
+            && consonant_skeleton(&text[s..i]) == sk
+            && house_after(i)
+        {
+            return true;
+        }
+    }
+    false
 }
 
 const LOCAL_TYPES: &[&str] = &[
@@ -637,7 +747,9 @@ fn flatten(v: &Value, out: &mut Vec<Value>) {
 }
 
 fn is_local(types: &[String]) -> bool {
-    types.iter().any(|t| LOCAL_TYPES.contains(&t.as_str()) || t.ends_with("store") || t.ends_with("clinic") || t.ends_with("salon"))
+    // «…Shop» — не тип schema.org (там Florist), но так пишут часто (buket.by: FlowerShop) — считаем
+    // местным бизнесом, а не «разметки нет».
+    types.iter().any(|t| LOCAL_TYPES.contains(&t.as_str()) || t.ends_with("store") || t.ends_with("clinic") || t.ends_with("salon") || t.ends_with("shop"))
 }
 
 fn schema_checks(ctx: &CheckCtx, v: &SiteView, out: &mut Vec<MetricResult>) {
@@ -674,6 +786,14 @@ fn schema_checks(ctx: &CheckCtx, v: &SiteView, out: &mut Vec<MetricResult>) {
     } else {
         MetricResult::fail("G01", "Структурированной разметки нет")
     });
+    // Разметки нет совсем: проверять нечего. Остальные метрики разметки — «не измерено», а не провал,
+    // иначе клиенту пишется и «нет разметки», и «в разметке нет данных о компании» (belodent.by).
+    if blocks == 0 && !microdata {
+        for id in ["G02", "G03", "G04", "G05", "G06", "G07", "G08"] {
+            out.push(MetricResult::na(id, "Разметки нет — см. G01"));
+        }
+        return;
+    }
     let all_types: HashSet<String> = objects.iter().flat_map(types_of).collect();
     let local = objects.iter().find(|o| is_local(&types_of(o)));
     let org = local.or_else(|| objects.iter().find(|o| types_of(o).iter().any(|t| t == "organization" || t == "corporation")));
@@ -728,8 +848,23 @@ fn schema_checks(ctx: &CheckCtx, v: &SiteView, out: &mut Vec<MetricResult>) {
         Some(c) if all_markup.contains(c) => Some(c.clone()),
         _ => local.and_then(|o| o["telephone"].as_str()).and_then(phone_key),
     };
+    // Номера, видимые на сайте (текст и tel:-ссылки): если номер разметки на сайте есть, а номера
+    // карточки нет — устарела карточка на картах (OSM, Overture), а не разметка (belstom.by, g-y.by).
+    let site_phones: HashSet<String> = v
+        .pages
+        .iter()
+        .flat_map(|p| crate::text::phones_in_text(&p.text).into_iter().chain(p.tel_links.iter().filter_map(|t| phone_key(t))))
+        .collect();
     out.push(match (markup_phone, card_phone) {
         (Some(m), Some(c)) if m == c => MetricResult::pass("G05", "Телефон в разметке совпадает с карточкой"),
+        (Some(m), Some(c)) if site_phones.contains(&m) && !site_phones.contains(&c) => {
+            MetricResult::warn("G05", "В разметке и на сайте один номер, а в карточке на картах — другой: стоит обновить карточку")
+        }
+        // Оба номера на сайте есть (g-y.by: в карточке +375 29…, в разметке +375 44…): ошибки нет,
+        // но поисковику и ИИ лучше видеть один основной номер везде.
+        (Some(m), Some(c)) if site_phones.contains(&m) && site_phones.contains(&c) => {
+            MetricResult::warn("G05", "В разметке и в карточке разные номера, оба есть на сайте — лучше указать один основной номер везде")
+        }
         (Some(_), Some(_)) => MetricResult::fail("G05", "Телефон в разметке отличается от карточки"),
         _ => MetricResult::na("G05", "Нет телефона в разметке или в карточке"),
     });
@@ -760,11 +895,11 @@ fn schema_checks(ctx: &CheckCtx, v: &SiteView, out: &mut Vec<MetricResult>) {
     });
 }
 
-/// Поисковые ИИ-боты. Google-Extended — не отдельный бот, а токен: его запрет убирает сайт
-/// и из обучения Gemini, и из источников ответов приложения Gemini.
-const AI_SEARCH: &[&str] = &["OAI-SearchBot", "Claude-SearchBot", "PerplexityBot", "bingbot", "Applebot", "DuckAssistBot", "Meta-WebIndexer", "Google-Extended"];
+/// Поисковые ИИ-боты (I02): только те, что ищут и отвечают с источниками. Боты обучения моделей
+/// (GPTBot, ClaudeBot, Google-Extended, CCBot…) — отдельная метрика I04: на поиск они не влияют.
+const AI_SEARCH: &[&str] = &["OAI-SearchBot", "Claude-SearchBot", "PerplexityBot"];
 const AI_USER: &[&str] = &["ChatGPT-User", "Claude-User", "Perplexity-User"];
-const AI_TRAIN: &[&str] = &["GPTBot", "ClaudeBot", "Applebot-Extended", "CCBot", "Meta-ExternalAgent"];
+const AI_TRAIN: &[&str] = &["GPTBot", "ClaudeBot", "Google-Extended", "Applebot-Extended", "CCBot", "Meta-ExternalAgent"];
 
 /// Запреты вписал Cloudflare (Managed robots.txt), а не владелец сайта.
 fn cloudflare_managed(robots: &str) -> bool {
@@ -785,28 +920,28 @@ fn ai_checks(ctx: &CheckCtx, v: &SiteView, out: &mut Vec<MetricResult>) {
         || v.home.headers_all("x-robots-tag").any(|x| x.to_lowercase().contains("nosnippet"));
     let google_ok = robots_body.is_none_or(|b| robots::allowed(b, "Googlebot", home_url));
     out.push(if !google_ok {
-        MetricResult::fail("I01", "Googlebot закрыт в robots.txt — сайта не будет в AI Overviews и AI Mode")
+        MetricResult::fail("I01", "Googlebot закрыт в robots.txt — сайта не будет в AI Overviews и AI Mode").with_value("robots")
     } else if snippet_block {
-        MetricResult::fail("I01", "nosnippet / max-snippet:0 — Google не сможет цитировать страницу")
+        MetricResult::fail("I01", "nosnippet / max-snippet:0 — Google не сможет цитировать страницу").with_value("nosnippet")
     } else if page.data_nosnippet {
-        MetricResult::warn("I01", "Часть текста помечена data-nosnippet")
+        MetricResult::warn("I01", "Часть текста помечена data-nosnippet").with_value("data_nosnippet")
     } else {
         MetricResult::pass("I01", "Googlebot пущен, сниппет не ограничен")
     });
-    let search_blocked: Vec<String> = blocked_for(AI_SEARCH)
-        .into_iter()
-        .map(|a| if a == "Google-Extended" { "Google-Extended (источники приложения Gemini)".to_string() } else { a })
-        .collect();
+    let search_blocked: Vec<String> = blocked_for(AI_SEARCH);
     let user_blocked = blocked_for(AI_USER);
+    // Закрытые поисковые боты и боты по запросу пользователя — в значение: по ним клиентскому тексту
+    // называют ровно те сервисы, чей поиск закрыт. Боты обучения (GPTBot, ClaudeBot) сюда не входят.
+    let all_closed = [search_blocked.clone(), user_blocked.clone()].concat().join(", ");
     let cf_note = if robots_body.is_some_and(cloudflare_managed) {
         " — запрет вписал Cloudflare (управляемый robots.txt), снимается в панели Cloudflare"
     } else {
         ""
     };
     out.push(if !search_blocked.is_empty() {
-        MetricResult::fail("I02", format!("Закрыты поисковые ИИ-боты: {}{cf_note}", search_blocked.join(", ")))
+        MetricResult::fail("I02", format!("Закрыты поисковые ИИ-боты: {}{cf_note}", search_blocked.join(", "))).with_value(all_closed.clone())
     } else if !user_blocked.is_empty() {
-        MetricResult::warn("I02", format!("Закрыты боты по запросу пользователя: {}", user_blocked.join(", ")))
+        MetricResult::warn("I02", format!("Закрыты боты по запросу пользователя: {}", user_blocked.join(", "))).with_value(all_closed.clone())
     } else {
         MetricResult::pass("I02", "Поисковые ИИ-боты не запрещены")
     });
@@ -821,19 +956,20 @@ fn ai_checks(ctx: &CheckCtx, v: &SiteView, out: &mut Vec<MetricResult>) {
         MetricResult::pass("I03", "YandexAdditional не запрещён")
     });
     let train = blocked_for(AI_TRAIN);
-    out.push(MetricResult::info("I04", if train.is_empty() { "Обучающие боты не запрещены".to_string() } else { format!("Запрещены для обучения: {}{cf_note}", train.join(", ")) }).with_value(train.len()));
+    out.push(MetricResult::info("I04", if train.is_empty() { "Обучающие боты не запрещены".to_string() } else { format!("Запрещены для обучения: {}{cf_note}", train.join(", ")) }).with_value(train.join(", ")));
 
     // Сравниваем с тем, что получил браузер: заглушка у бота считается, только если у браузера её нет.
+    // Бота, закрытого в robots.txt, не проверяем: это I02, а не защита сайта.
     let browser_ok = v.home.ok();
     let browser_challenge = crate::site::looks_like_challenge(v.home);
-    let blocked: Vec<String> = v
-        .snap
-        .bots
+    let open_bots: Vec<&crate::site::BotProbe> = v.snap.bots.iter().filter(|b| robots_body.is_none_or(|r| robots::allowed(r, &b.agent, home_url))).collect();
+    // Любой ответ не 200 (403, 429, 503, нестандартные 490 и т. п. у Qrator/DDoS-Guard) — защита режет бота.
+    let blocked: Vec<String> = open_bots
         .iter()
-        .filter(|b| browser_ok && ((b.challenge && !browser_challenge) || b.status.is_some_and(|s| matches!(s, 401 | 403 | 429 | 503))))
+        .filter(|b| browser_ok && ((b.challenge && !browser_challenge) || b.status.is_some_and(|s| s >= 400)))
         .map(|b| format!("{} ({})", b.agent, if b.challenge { "заглушка WAF".to_string() } else { b.status.unwrap_or(0).to_string() }))
         .collect();
-    let errors = v.snap.bots.iter().filter(|b| b.error.is_some()).count();
+    let errors = open_bots.iter().filter(|b| b.error.is_some()).count();
     // Мы шлём User-Agent бота со своего IP. Крупные CDN (Cloudflare, Akamai) проверяют ботов по
     // IP и отказывают именно самозванцам, а настоящих пускают. Поэтому отказ — повод проверить
     // настройки, а не доказательство, что ИИ сайт не видит: «внимание», не стоп-фактор.
@@ -845,10 +981,12 @@ fn ai_checks(ctx: &CheckCtx, v: &SiteView, out: &mut Vec<MetricResult>) {
                 blocked.join(", ")
             ),
         )
-    } else if errors == v.snap.bots.len() && errors > 0 {
+    } else if open_bots.is_empty() && !v.snap.bots.is_empty() {
+        MetricResult::na("I05", "Боты закрыты в robots.txt — защиту сайта не проверить (см. I02)")
+    } else if errors == open_bots.len() && errors > 0 {
         MetricResult::na("I05", "Пробы ботов не прошли (сеть)")
     } else {
-        MetricResult::pass("I05", format!("Боты получают страницу: {}", v.snap.bots.iter().map(|b| format!("{} {}", b.agent, b.status.unwrap_or(0))).collect::<Vec<_>>().join(", ")))
+        MetricResult::pass("I05", format!("Боты получают страницу: {}", open_bots.iter().map(|b| format!("{} {}", b.agent, b.status.unwrap_or(0))).collect::<Vec<_>>().join(", ")))
     });
     let spa_markers = ["<div id=\"root\"></div>", "<div id=\"app\"></div>", "id=\"__nuxt\"", "<app-root", "ng-version"];
     let spa = spa_markers.iter().any(|m| page.html_lower.contains(m));
@@ -864,7 +1002,13 @@ fn ai_checks(ctx: &CheckCtx, v: &SiteView, out: &mut Vec<MetricResult>) {
         } else {
             MetricResult::fail(
                 "I06",
-                format!("В исходном HTML {raw} слов, после выполнения скриптов — {}: ИИ-боты (GPTBot, ClaudeBot, PerplexityBot) видят почти пустую страницу", page.words),
+                if raw >= 100 {
+                    // 680 из 1606 слов (restoransvoi.by), 155 слов (flamingobabybk.com) — не «пустая», но часть текста боты не видят.
+                    // «Почти пустая» — только когда в исходном HTML меньше 100 слов.
+                    format!("Без выполнения скриптов видна только часть текста: {raw} слов из {} — остальное ИИ-боты (GPTBot, ClaudeBot, PerplexityBot) не прочитают", page.words)
+                } else {
+                    format!("В исходном HTML {raw} слов, после выполнения скриптов — {}: ИИ-боты (GPTBot, ClaudeBot, PerplexityBot) видят почти пустую страницу", page.words)
+                },
             )
         }
         .with_value(share)
@@ -942,6 +1086,25 @@ fn ai_checks(ctx: &CheckCtx, v: &SiteView, out: &mut Vec<MetricResult>) {
             }
         }
     }
+    if prices < 3 {
+        // Страница цен (/ceny, /prices…) с таблицей чисел без знака валюты (bogemiastom.by/ceny:
+        // «1200», «990», «2400»): валюта подразумевается — это прайс.
+        static PRICE_INT: OnceLock<Regex> = OnceLock::new();
+        const PRICE_SLUGS: &[&str] = &[
+            "ceny", "tseny", "/cena", "price", "prais", "prajs", "praice", "stoimost", "tarif", "preise", "kosten", "prix", "precio",
+            "prezzi", "cennik", "prijzen", "precos", "preco",
+        ];
+        let int_re = re(&PRICE_INT, r"(?:^|[\s|:])\d{2,5}(?:$|[\s|;])");
+        if let Some(n) = v
+            .pages
+            .iter()
+            .filter(|p| url::Url::parse(&p.url).is_ok_and(|u| PRICE_SLUGS.iter().any(|s| u.path().to_lowercase().contains(s))))
+            .map(|p| int_re.find_iter(&p.text).count())
+            .find(|n| *n >= 5)
+        {
+            prices += n;
+        }
+    }
     // Каталог с ценами — в магазине на поддомене (shop.…), куда обход сайта не заходит.
     let own_domain = crate::text::registrable_domain(v.final_url.host_str().unwrap_or(""));
     let shop_subdomain = v.pages.iter().flat_map(|p| p.links.iter()).find_map(|l| {
@@ -962,13 +1125,42 @@ fn ai_checks(ctx: &CheckCtx, v: &SiteView, out: &mut Vec<MetricResult>) {
         _ => MetricResult::new("I08", match prices { 0 => Status::Fail, 1 | 2 => Status::Warn, _ => Status::Pass }, format!("Упоминаний цен: {prices}")).with_value(prices),
     });
     let faq_schema = v.pages.iter().any(|p| p.jsonld.iter().any(|j| j.contains("FAQPage")));
-    let questions: usize = v.pages.iter().map(|p| p.question_headings + p.details_blocks).sum::<usize>() + if faq_schema { 5 } else { 0 };
+    // Раздел вопросов обычными абзацами («ВОПРОС — ОТВЕТ: Повреждается ли эмаль…?», narodent.by):
+    // заголовка у раздела нет, но вопросы со знаком «?» под подписью раздела — это ответы на вопросы.
+    const FAQ_MARKERS: &[&str] = &[
+        "вопрос — ответ", "вопрос-ответ", "вопрос - ответ", "вопрос – ответ", "частые вопросы", "часто задаваемые", "пытанні і адказы",
+        "frequently asked", "questions fréquentes", "preguntas frecuentes", "häufige fragen", "domande frequenti", "veelgestelde vragen",
+        "perguntas frequentes", "najczęściej zadawane", "pytania i odpowiedzi", "faq",
+    ];
+    let plain_faq: usize = v
+        .pages
+        .iter()
+        .filter(|p| p.question_headings + p.details_blocks == 0)
+        .filter(|p| {
+            // Подпись раздела вне меню: «Вопрос-ответ» пунктом меню есть на каждой странице.
+            let t = p.text_lower();
+            FAQ_MARKERS.iter().any(|m| {
+                let in_links = p.links.iter().filter(|l| l.text.to_lowercase().replace('ё', "е").contains(m)).count();
+                t.matches(m).count() > in_links
+            })
+        })
+        .map(|p| p.text.matches('?').count())
+        .filter(|n| *n >= 2)
+        .map(|n| n.min(10))
+        .sum();
+    let questions: usize =
+        v.pages.iter().map(|p| p.question_headings + p.details_blocks).sum::<usize>() + plain_faq + if faq_schema { 5 } else { 0 };
     out.push(MetricResult::new("I09", match questions { 0 => Status::Fail, 1..=4 => Status::Warn, _ => Status::Pass }, format!("Вопросов-ответов на страницах: {questions}")).with_value(questions));
-    let about = v.pages.iter().flat_map(|p| p.links.iter()).any(|l| {
-        let s = format!("{} {}", l.href, l.text).to_lowercase();
-        crate::lexicon::ABOUT.iter().any(|m| s.contains(m))
+    let about_link = v.pages.iter().flat_map(|p| p.links.iter()).any(|l| crate::lexicon::is_about_link(&l.href, &l.text));
+    let about_pages: Vec<&PageInfo> = v.pages.iter().skip(1).copied().filter(|p| crate::lexicon::is_about_link(&p.url, "")).collect();
+    let facts = company_facts(&v.pages.iter().take(1).chain(about_pages.iter()).map(|p| p.text.as_str()).collect::<Vec<_>>().join(" "));
+    out.push(if about_link || !about_pages.is_empty() {
+        MetricResult::pass("I10", if facts.is_empty() { "Есть страница «О компании»".to_string() } else { format!("Есть страница «О компании»; факты: {}", facts.join(", ")) })
+    } else if facts.len() >= 2 {
+        MetricResult::pass("I10", format!("Рассказ о компании с фактами есть на главной: {}", facts.join(", ")))
+    } else {
+        MetricResult::warn("I10", "Страницы «О компании» не найдено")
     });
-    out.push(if about { MetricResult::pass("I10", "Есть страница «О компании»") } else { MetricResult::warn("I10", "Страницы «О компании» не найдено") });
     let articles: Vec<_> = v
         .snap
         .pages
@@ -994,6 +1186,10 @@ fn ai_checks(ctx: &CheckCtx, v: &SiteView, out: &mut Vec<MetricResult>) {
             path.contains("/social/") || ["instagram", "vkontakte", "facebook", "telegram", "viber", "youtube", "tiktok"].iter().any(|m| path.contains(m))
         };
         own_redirect || crate::lexicon::PROFILE_LINKS.iter().any(|m| h.contains(m))
+    }) || v.pages.iter().flat_map(|p| p.iframes.iter()).any(|src| {
+        // Виджет страницы в соцсети (facebook.com/plugins/page, likebox, vk.com/widget_community) — тоже связь.
+        let s = src.to_lowercase();
+        ["facebook.com/plugins", "vk.com/widget", "instagram.com/embed", "ok.ru/dk?st.cmd=widget", "youtube.com/embed"].iter().any(|m| s.contains(m))
     });
     out.push(match (same_as, card_links) {
         (true, _) => MetricResult::pass("I13", "sameAs в разметке связывает сайт с профилями"),
@@ -1006,6 +1202,34 @@ fn ai_checks(ctx: &CheckCtx, v: &SiteView, out: &mut Vec<MetricResult>) {
         _ => "llms.txt нет (на Google не влияет)".to_string(),
     }));
     super::ai::run(ctx, v, prices, out);
+}
+
+/// Проверяемые факты о компании в тексте: год основания или опыт, лицензия с номером, команда.
+pub(crate) fn company_facts(text: &str) -> Vec<&'static str> {
+    use std::sync::OnceLock;
+    static YEAR: OnceLock<regex::Regex> = OnceLock::new();
+    static LIC: OnceLock<regex::Regex> = OnceLock::new();
+    static TEAM: OnceLock<regex::Regex> = OnceLock::new();
+    let year = YEAR.get_or_init(|| {
+        regex::Regex::new(r"(?i)(?:с|since|seit|depuis|desde|dal|od|sinds|founded|established|основан\w*|gegründet|fondée?|fundad[oa]|fondat[oa]|założon\w*|opgericht)\s*(?:en\s+|in\s+|в\s*)?(?:19|20)\d{2}|(?:более|свыше|over|more than|mehr als|plus de|más de|più di|ponad|meer dan)\s*\d{1,2}\s*(?:лет|года|years|jahre|ans|años|anni|lat|jaar|anos)|\d{1,2}\s*(?:лет|years|jahre|ans|años|anni|lat|jaar|anos)\s*(?:на рынке|опыта|of experience|erfahrung|d.expérience|de experiencia|di esperienza|doświadczenia|ervaring|de experiência)").unwrap()
+    });
+    let lic = LIC.get_or_init(|| {
+        regex::Regex::new(r"(?i)(?:лицензи\w*|свидетельств\w*|license|licence|licen[cs]e no|lizenz|licencia|licenza|licença|licentie|licencja|унп|огрн|инн|vat|siret|nip|ust-id|cif|p\.?\s?iva)\s*(?:№|no\.?|n°|nº|nr\.?|num\.?)?\s*[:#]?\s*[a-zа-я]{0,3}[\s-]?\d{4,}").unwrap()
+    });
+    let team = TEAM.get_or_init(|| {
+        regex::Regex::new(r"(?i)\b(?:наша команда|наши (?:врачи|специалисты|мастера)|врачи клиники|our (?:team|doctors|dentists|staff)|meet the team|unser team|unsere (?:ärzte|zahnärzte)|notre équipe|nuestro equipo|il nostro team|nasz zespół|ons team|nossa equipe|nossa equipa)\b").unwrap()
+    });
+    let mut out = vec![];
+    if year.is_match(text) {
+        out.push("год или опыт");
+    }
+    if lic.is_match(text) {
+        out.push("лицензия или реквизиты");
+    }
+    if team.is_match(text) {
+        out.push("команда");
+    }
+    out
 }
 
 #[cfg(test)]
@@ -1032,6 +1256,19 @@ mod tests {
         assert!(address_matches("Мінск, вуліца Кірава, 15", "г. минск, ул.кирова,15"), "аканье");
         assert!(address_matches("Москва, проспект Мира, 5", "пр-т мира, 5"), "служебные слова после о→а");
         assert!(address_matches("Minsk, vulica Uĺjanaŭskaja 29", "минск, ул. ульяновская, 29"), "белорусская латиница");
+        // Без словаря — по согласным (belodent.by: «Прытыцкага» ↔ «Притыцкого»).
+        assert!(address_matches("Мінск, вуліца Прытыцкага, 39", "минск, ул. притыцкого, 39, 150 м от ст. м. спортивная"));
+        assert!(address_matches("Мінск, вуліца Дзяржынскага, 5", "г. минск, ул. дзержинского 5"));
+        assert!(address_matches("Мінск, вуліца Будзённага, 12", "ул. буденного, д. 12"));
+        assert!(address_matches("Мінск, вуліца Шчорса, 9", "ул. щорса 9"));
+        assert!(address_matches("Мінск, вуліца Цімірязева, 67", "ул. тимирязева, 67"));
+        // Русская транслитерация в карточке Overture (stomatologi.by).
+        assert!(address_matches("Ulitsa L'va Sapegi 9", "минск, ул. льва сапеги, дом 9"));
+        assert!(address_matches("Prospekt Pobediteley 119", "пр. победителей, 119, пом. 496"));
+        assert!(!address_matches("Ulitsa L'va Sapegi 9", "ул. льва сапеги, дом 19"));
+        // Номер дома должен стоять при улице, и номер чужой — не совпадение.
+        assert!(!address_matches("Мінск, вуліца Прытыцкага, 39", "ул. притыцкого, 139"));
+        assert!(!address_matches("Мінск, вуліца Прытыцкага, 39", "ул. притыцкого, 62. работаем с 9 до 21, тел. 39-00-00 и 39"));
         // Название компании на сайте записано иначе — это всё равно её сайт.
         assert!(name_on_site("Рэдакцыя радыёпраграмы «Рускае радыё»", "русское радио минск", None, "rusradio"));
         assert!(name_on_site("Місс Лі", "салон miss li", None, "missli"));
@@ -1039,6 +1276,10 @@ mod tests {
         assert!(name_on_site("Белпошта", "белпочта отделения", None, "belpost"));
         assert!(name_on_site("RESPAWN", "главная", None, "respawn"));
         assert!(!name_on_site("Респектор Тревел", "ставки и слоты в кыргызстане", None, "spinbetter"));
+        // Общее слово названия на чужом сайте отрасли — не свой сайт (скан 18).
+        assert!(!name_on_site("Мои Любимые Туры", "новости туризма беларуси: горящие туры в египет", None, "travelnews"));
+        assert!(!name_on_site("La Crête D'Or (Золотой Гребешок)", "японские обои в минске", None, "zolotoi"));
+        assert!(name_on_site("Клиника \"Стоматология Васильевых\"", "стоматология васильевых — лечение зубов", None, "stomatology"));
         assert!(!name_on_site("Бар Персонажи", "kalyan.by выставлен на продажу", None, "kalyan"));
     }
 
@@ -1050,3 +1291,4 @@ mod tests {
         assert!(address_re().is_match("пр-т Мира, д. 3"));
     }
 }
+

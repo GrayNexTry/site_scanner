@@ -2,10 +2,11 @@ import { useEffect, useMemo, useState } from "react";
 import { Link, useNavigate, useParams } from "react-router";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { api, type Business, type Lead, type ScanOverview, type SiteState } from "../api";
+import { AiBatchBar } from "./AiDraft";
 import { CardLinks, ConfirmButton, Empty, LeadBadge, Progress, ScanStatus, ScoreBar } from "../components";
 import { useScanEvents } from "../hooks";
 import { ResultsMap } from "../map";
-import { absUrl, countryName, DISCOVERY_SOURCE, fmtDate, fmtRadius, hostOf, LEAD_LABEL, LEAD_STATUS_LABEL, plural, PROVIDER_LABEL, SITE_STATE_LABEL, SITE_STATE_TONE } from "../format";
+import { absUrl, contactShort, countryName, DISCOVERY_SOURCE, fmtDate, fmtDay, fmtMoney, fmtRadius, hostOf, isOverdue, LEAD_LABEL, LEAD_STATUS_LABEL, plural, PROVIDER_LABEL, SITE_STATE_LABEL, SITE_STATE_TONE } from "../format";
 
 /** Строк таблицы за раз: у большого скана их тысячи. */
 const PAGE = 200;
@@ -74,7 +75,9 @@ function Overview({ o, state, onState, onRecheck, rechecking }: { o: ScanOvervie
   );
 }
 
-type Filter = "all" | Lead | "pending" | "nosite" | "found" | "work";
+type Filter = "all" | Lead | "pending" | "nosite" | "found" | "work" | "weak";
+/** Отбор для менеджера: переключатели, которые можно совмещать с любым фильтром. */
+type Pick = "contacts" | "fresh";
 type Sort = "priority" | "score" | "reviews" | "name";
 
 const FILTERS: { id: Filter; label: string }[] = [
@@ -82,7 +85,8 @@ const FILTERS: { id: Filter; label: string }[] = [
   { id: "hot", label: LEAD_LABEL.hot },
   { id: "warm", label: LEAD_LABEL.warm },
   { id: "cold", label: LEAD_LABEL.cold },
-  { id: "nosite", label: "Без сайта" },
+  { id: "nosite", label: "Нет сайта" },
+  { id: "weak", label: "Слабый/средний сайт" },
   { id: "found", label: "Сайт найден в обход карт" },
   { id: "work", label: "В работе" },
   { id: "pending", label: "Ждут проверки" },
@@ -95,7 +99,44 @@ function matches(b: Business, f: Filter): boolean {
   if (f === "nosite") return !b.website && !b.discovery?.found;
   if (f === "found") return !!b.discovery?.found;
   if (f === "work") return b.lead_status !== "new";
+  if (f === "weak") return ["weak", "fair"].includes(b.report?.mini?.state ?? "");
   return b.lead === f;
+}
+
+function matchesPick(b: Business, p: Pick): boolean {
+  return p === "contacts" ? b.has_contacts === true : b.lead_status === "new";
+}
+
+/** Каналы связи: значки видов контактов; «нет» — писать некуда (после проверки). */
+function ChannelsCell({ b }: { b: Business }) {
+  const kinds = b.contact_kinds;
+  if (!kinds) return <span className="faint small">—</span>;
+  if (kinds.length === 0) return <span className="small st-warn" title="Контактов нет: найдите вручную на странице компании" style={{ whiteSpace: "nowrap" }}>нет контактов</span>;
+  const shown = kinds.slice(0, 4);
+  return (
+    <span className="channels" aria-label={`Контакты: ${kinds.map(contactShort).join(", ")}`}>
+      {shown.map((k) => <span key={k} className="tag">{contactShort(k)}</span>)}
+      {kinds.length > shown.length && <span className="tag" title={kinds.slice(4).map(contactShort).join(", ")}>+{kinds.length - shown.length}</span>}
+    </span>
+  );
+}
+
+/** Работа с лидом: статус, следующий шаг (просрочено — красным) и цена сделки. */
+function WorkCell({ b }: { b: Business }) {
+  const late = isOverdue(b.next_action_at);
+  const none = b.lead_status === "new" && !b.next_action_at && !b.next_action && b.deal_price == null;
+  if (none) return <span className="faint small">—</span>;
+  return (
+    <span className="small" style={{ display: "grid", gap: 2 }}>
+      {b.lead_status !== "new" && <span><span className="tag tag-ink">{LEAD_STATUS_LABEL[b.lead_status]}</span></span>}
+      {(b.next_action_at || b.next_action) && (
+        <span className={late ? "st-fail" : "muted"} title={b.next_action ?? undefined}>
+          {b.next_action_at && <b>{fmtDay(b.next_action_at)}</b>}{late && " · просрочено"}{b.next_action && <span className="clamp-1">{b.next_action}</span>}
+        </span>
+      )}
+      {b.deal_price != null && <span className="num">{fmtMoney(b.deal_price, b.deal_currency)}</span>}
+    </span>
+  );
 }
 
 function SiteCell({ b }: { b: Business }) {
@@ -141,6 +182,8 @@ export default function ScanPage() {
   const [q, setQ] = useState("");
   const [selected, setSelected] = useState<number | null>(null);
   const [showMap, setShowMap] = useState(true);
+  const [picks, setPicks] = useState<Pick[]>([]);
+  const togglePick = (p: Pick) => setPicks((x) => (x.includes(p) ? x.filter((y) => y !== p) : [...x, p]));
   const [siteState, setSiteState] = useState<SiteState | null>(null);
   const [limit, setLimit] = useState(PAGE);
   const overviewQ = useQuery({
@@ -175,22 +218,29 @@ export default function ScanPage() {
   const list = listQ.data ?? [];
   const hasReviews = list.some((b) => b.reviews != null);
   const counts = useMemo(() => {
-    const c: Record<Filter, number> = { all: list.length, hot: 0, warm: 0, cold: 0, closed: 0, pending: 0, nosite: 0, found: 0, work: 0 };
+    const c: Record<Filter, number> = { all: list.length, hot: 0, warm: 0, cold: 0, closed: 0, pending: 0, nosite: 0, found: 0, work: 0, weak: 0 };
     for (const b of list) {
       if (b.lead) c[b.lead]++;
       if (b.audit_status !== "done") c.pending++;
       if (!b.website && !b.discovery?.found) c.nosite++;
       if (b.discovery?.found) c.found++;
       if (b.lead_status !== "new") c.work++;
+      if (matches(b, "weak")) c.weak++;
     }
     return c;
   }, [list]);
+
+  const pickCounts = useMemo(
+    () => ({ contacts: list.filter((b) => matchesPick(b, "contacts")).length, fresh: list.filter((b) => matchesPick(b, "fresh")).length }),
+    [list],
+  );
 
   const shown = useMemo(() => {
     const needle = q.trim().toLowerCase();
     const items = list.filter(
       (b) =>
         matches(b, filter) &&
+        picks.every((p) => matchesPick(b, p)) &&
         (!siteState || (b.report?.mini?.state ?? "unknown") === siteState) &&
         (!needle || `${b.name} ${b.address ?? ""} ${b.category ?? ""} ${b.website ?? ""} ${b.site_url ?? ""} ${b.notes ?? ""}`.toLowerCase().includes(needle)),
     );
@@ -201,8 +251,8 @@ export default function ScanPage() {
       name: (a, b) => a.name.localeCompare(b.name, "ru"),
     };
     return items.sort(by[sort]);
-  }, [list, filter, sort, q, siteState]);
-  useEffect(() => setLimit(PAGE), [filter, sort, q, siteState]);
+  }, [list, filter, picks, sort, q, siteState]);
+  useEffect(() => setLimit(PAGE), [filter, picks, sort, q, siteState]);
 
   if (scanQ.error) return <div className="page"><div className="banner error">{scanQ.error.message}</div></div>;
   const scan = scanQ.data?.scan;
@@ -287,6 +337,14 @@ export default function ScanPage() {
           ))}
         </div>
         <span className="spacer" />
+        <div className="chips" role="group" aria-label="Отбор для работы">
+          <button className="chip" aria-pressed={picks.includes("contacts")} onClick={() => togglePick("contacts")} title="Только компании, у которых есть куда написать">
+            Есть контакты <span className="count">{pickCounts.contacts}</span>
+          </button>
+          <button className="chip" aria-pressed={picks.includes("fresh")} onClick={() => togglePick("fresh")} title="Ещё не писали и не отмечали этап">
+            Не в работе <span className="count">{pickCounts.fresh}</span>
+          </button>
+        </div>
         <input className="input" style={{ width: 220 }} placeholder="Поиск по названию, адресу" value={q} onChange={(e) => setQ(e.target.value)} aria-label="Поиск" />
         <select className="select" style={{ width: 215 }} value={sort} onChange={(e) => setSort(e.target.value as Sort)} aria-label="Сортировка">
           <option value="priority">Сначала лучшие лиды</option>
@@ -296,6 +354,8 @@ export default function ScanPage() {
         </select>
         {scan.kind === "map" && <button className="btn" onClick={() => setShowMap((v) => !v)}>{showMap ? "Скрыть карту" : "Показать карту"}</button>}
       </div>
+
+      {list.length > 0 && <div className="row"><AiBatchBar items={shown.filter((b) => b.audit_status === "done").map((b) => ({ id: b.id, hasContacts: matchesPick(b, "contacts") }))} /></div>}
 
       <div className={showMap && scan.kind === "map" ? "split" : ""}>
         <div className="card">
@@ -321,6 +381,8 @@ export default function ScanPage() {
                     <th>Компания</th>
                     <th>Сайт</th>
                     <th>Лид</th>
+                    <th>Контакты</th>
+                    <th>Работа</th>
                     <th style={{ width: 140 }}>Балл сайта</th>
                     {hasReviews && <th>Отзывы</th>}
                     <th>Карточки</th>
@@ -347,12 +409,16 @@ export default function ScanPage() {
                         ) : (
                           b.report?.lead_reasons[0] && <div className={`small lead-${b.lead}`} style={{ marginTop: 2 }}>{b.report.lead_reasons[0]}</div>
                         )}
+                        {b.audit_status === "done" && (
+                          <Link className="btn btn-sm" style={{ marginTop: 6 }} to={`/businesses/${b.id}#outreach`} onClick={(e) => e.stopPropagation()} aria-label={`Написать: ${b.name}`}>Написать</Link>
+                        )}
                       </td>
                       <td className="cell-site"><SiteCell b={b} /></td>
                       <td>
                         {b.audit_status === "running" ? <span className="small muted">проверяю…</span> : b.audit_status === "failed" ? <span className="small st-fail" title={b.error ?? ""}>ошибка</span> : <LeadBadge lead={b.lead} />}
-                        {b.lead_status !== "new" && <div className="small muted" style={{ marginTop: 2 }}>{LEAD_STATUS_LABEL[b.lead_status]}</div>}
                       </td>
+                      <td><ChannelsCell b={b} /></td>
+                      <td><WorkCell b={b} /></td>
                       <td><ScoreBar value={b.overall} /></td>
                       {hasReviews && (
                         <td className="num small">

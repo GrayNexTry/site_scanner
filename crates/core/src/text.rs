@@ -308,6 +308,22 @@ const AGGREGATOR: &[&str] = &[
     "glovoapp.com", "just-eat.es", "just-eat.fr", "just-eat.ie", "airbnb.com", "airbnb.co.uk", "airbnb.fr", "airbnb.es",
     "hotels.com", "expedia.com", "agoda.com", "lafourchette.com", "petitfute.com", "routard.com", "minube.com",
     "eventbrite.com", "eventbrite.co.uk", "meetup.com", "nextdoor.com", "alignable.com", "zillow.com", "realtor.com",
+    // Каталоги и реестры Беларуси (скан стоматологий Минска: kramba.by у 11 клиник, pointer.by у 4).
+    "kramba.by", "pointer.by", "dosug.by", "talon.by", "2doc.by", "onliner.by", "realt.by", "slivki.by", "bycard.by",
+    "egr.gov.by",
+    // Реестры компаний и справочники Европы и США.
+    "opencorporates.com", "dnb.com", "infobel.com", "cylex.co.uk", "cylex.de", "cylex.fr", "cylex.es", "cylex.it",
+    "hotfrog.com", "hotfrog.co.uk", "freeindex.co.uk", "thomsonlocal.com", "bark.com", "checkatrade.com",
+    "find-and-update.company-information.service.gov.uk", "endole.co.uk", "companycheck.co.uk",
+    "societe.com", "pappers.fr", "infogreffe.fr", "verif.com", "118712.fr", "mappy.com",
+    "northdata.de", "northdata.com", "firmenwissen.de", "cylex-branchenbuch.de",
+    "empresite.eleconomista.es", "einforma.com", "axesor.es", "infoempresa.com",
+    "paginebianche.it", "registroimprese.it", "europages.com", "kompass.com", "cybo.com", "waze.com",
+    "panoramafirm.pl", "pkt.pl", "aleo.com", "oferteo.pl", "pai.pt", "racius.com", "telefoonboek.nl",
+    "detelefoongids.nl", "openingstijden.nl", "bizapedia.com", "opengovus.com", "buzzfile.com",
+    "loc8nearme.com", "cityseeker.com", "merchantcircle.com", "showmelocal.com", "brownbook.net",
+    // Порталы: в карточке OSM встречается fr.yahoo.com вместо сайта компании (Лондон, скан 20).
+    "yahoo.com", "yahoo.co.uk", "yahoo.fr", "yahoo.de", "yahoo.es", "yahoo.it", "yahoo.co.jp", "msn.com", "aol.com",
 ];
 const BOOKING: &[&str] = &[
     "yclients.com", "dikidi.net", "dikidi.ru", "dikidi.online", "booksy.com", "sonline.su", "restoplace.ws", "bookform.ru",

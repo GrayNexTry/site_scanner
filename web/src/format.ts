@@ -1,5 +1,5 @@
 // Подписи, цвета и форматирование.
-import type { DiscoverySource, Lead, LeadStatus, ProviderId, ScanStatus, SiteState, Status } from "./api";
+import type { ActivityKind, Channel, DiscoverySource, Lead, LeadStatus, ProviderId, ScanStatus, SiteState, Status } from "./api";
 
 export const LEAD_LABEL: Record<Lead, string> = {
   hot: "Горячий",
@@ -90,6 +90,7 @@ export const LEAD_STATUS_LABEL: Record<LeadStatus, string> = {
   new: "Новый",
   contacted: "Написали",
   talking: "Переговоры",
+  proposal: "КП отправлено",
   client: "Клиент",
   rejected: "Отказ",
   skip: "Не подходит",
@@ -153,3 +154,132 @@ export const SITE_STATE_TONE: Record<SiteState, "fail" | "warn" | "pass" | "mute
   closed: "muted",
   unknown: "muted",
 };
+
+/** Порядок воронки: по нему сравниваем, «раньше» ли статус. */
+export const FUNNEL: LeadStatus[] = ["new", "contacted", "talking", "proposal", "client"];
+
+export const CHANNEL_LABEL: Record<Channel, string> = {
+  instagram: "Instagram",
+  email: "Почта",
+  phone: "Телефон",
+  telegram: "Telegram",
+  whatsapp: "WhatsApp",
+  viber: "Viber",
+  vk: "ВКонтакте",
+  facebook: "Facebook",
+  visit: "Личный визит",
+  other: "Другое",
+};
+
+export const ACTIVITY_LABEL: Record<ActivityKind, string> = {
+  note: "Заметка",
+  message: "Написали",
+  reply: "Ответили",
+  call: "Звонок",
+  meeting: "Встреча",
+  proposal: "Отправили КП",
+  status: "Статус",
+  price: "Цена",
+};
+
+/** Вид контакта → подпись. */
+export const CONTACT_LABEL: Record<string, string> = {
+  phone: "Телефон",
+  email: "Почта",
+  instagram: "Instagram",
+  telegram: "Telegram",
+  whatsapp: "WhatsApp",
+  viber: "Viber",
+  vk: "ВКонтакте",
+  facebook: "Facebook",
+  tiktok: "TikTok",
+  youtube: "YouTube",
+  ok: "Одноклассники",
+  linkedin: "LinkedIn",
+  x: "X",
+  max: "MAX",
+  taplink: "Taplink",
+  linktree: "Linktree",
+  dzen: "Дзен",
+  rutube: "Rutube",
+  pinterest: "Pinterest",
+  threads: "Threads",
+  icq: "ICQ",
+  line: "LINE",
+  link: "Ссылка",
+};
+
+/** Короткая подпись канала для значков в таблице. */
+export function contactShort(kind: string): string {
+  return kind === "phone" ? "Тел." : (CONTACT_LABEL[kind] ?? kind);
+}
+
+export const CONTACT_SOURCE_LABEL: Record<string, string> = { card: "карточка", site: "сайт", manual: "вручную" };
+
+/** Подпись действия-ссылки у контакта. */
+export function contactAction(kind: string): string {
+  switch (kind) {
+    case "phone": return "Позвонить";
+    case "email": return "Написать";
+    case "whatsapp":
+    case "viber":
+    case "telegram": return "Написать";
+    default: return "Открыть";
+  }
+}
+
+const CURRENCY_SYMBOL: Record<string, string> = { BYN: "BYN", RUB: "₽", USD: "$", EUR: "€", GBP: "£", PLN: "zł" };
+
+/** «1 200 BYN». */
+export function fmtMoney(v: number | null | undefined, currency?: string | null): string {
+  if (v == null) return "—";
+  const n = new Intl.NumberFormat("ru-RU", { maximumFractionDigits: 2 }).format(v);
+  const c = currency ? CURRENCY_SYMBOL[currency] ?? currency : "";
+  return c ? `${n}\u00a0${c}` : n;
+}
+
+/** Сегодня как YYYY-MM-DD в локальном часовом поясе. */
+export function todayStr(offsetDays = 0): string {
+  const d = new Date();
+  d.setDate(d.getDate() + offsetDays);
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
+}
+
+/** Шаг просрочен: дата раньше сегодняшней. */
+export function isOverdue(date: string | null | undefined): boolean {
+  return !!date && date < todayStr();
+}
+
+const dayFmt = new Intl.DateTimeFormat("ru-RU", { day: "numeric", month: "short" });
+const dayYearFmt = new Intl.DateTimeFormat("ru-RU", { day: "numeric", month: "long", year: "numeric" });
+
+/** «3 дек» из YYYY-MM-DD. */
+export function fmtDay(date: string | null | undefined): string {
+  return date ? dayFmt.format(new Date(`${date}T12:00:00`)) : "—";
+}
+
+export function fmtLongDate(d: Date): string {
+  return dayYearFmt.format(d);
+}
+
+/** Копирование в буфер с запасным путём для http. */
+export async function copyText(text: string): Promise<boolean> {
+  try {
+    await navigator.clipboard.writeText(text);
+    return true;
+  } catch {
+    try {
+      const ta = document.createElement("textarea");
+      ta.value = text;
+      ta.style.position = "fixed";
+      ta.style.opacity = "0";
+      document.body.appendChild(ta);
+      ta.select();
+      const ok = document.execCommand("copy");
+      ta.remove();
+      return ok;
+    } catch {
+      return false;
+    }
+  }
+}

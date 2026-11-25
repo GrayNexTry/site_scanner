@@ -217,9 +217,9 @@ PSI и CrUX API требуют собственного ключа Google Cloud:
 | ID | Метрика | Как мерить | Норма / флаг | Где |
 |---|---|---|---|---|
 | I01 | Googlebot пущен; нет nosnippet / max-snippet:0 / data-nosnippet на ключевом контенте | robots + meta | иначе нет в AI Overviews и AI Mode → критично | В |
-| I02 | Поисковые ИИ-боты не запрещены: OAI-SearchBot, Claude-SearchBot, PerplexityBot, Bingbot, Applebot, DuckAssistBot, Meta-WebIndexer, Google-Extended (источники приложения Gemini); боты по запросу пользователя ChatGPT-User, Claude-User, Perplexity-User | парсер robots по каждому UA; запрет, вписанный Cloudflare (Managed robots.txt), отмечается отдельно | запрещён поисковый → флаг; по запросу пользователя → внимание | В |
+| I02 | Поисковые ИИ-боты не запрещены: OAI-SearchBot, Claude-SearchBot, PerplexityBot; боты по запросу пользователя ChatGPT-User, Claude-User, Perplexity-User | парсер robots по каждому UA; запрет, вписанный Cloudflare (Managed robots.txt), отмечается отдельно | запрещён поисковый → флаг; по запросу пользователя → внимание | В |
 | I03 | YandexAdditional не запрещён (Нейро, ответы Алисы) | явное правило; по сторонним данным `*` на него не распространяется | запрещён → флаг | В |
-| I04 | Обучающие боты (GPTBot, ClaudeBot, Applebot-Extended, CCBot, Meta-ExternalAgent) | парсер robots | решает клиент: запрет убирает сайт из памяти будущих моделей, на поиск не влияет (информ.) | В |
+| I04 | Обучающие боты (GPTBot, ClaudeBot, Google-Extended, Applebot-Extended, CCBot, Meta-ExternalAgent) | парсер robots | решает клиент: запрет убирает сайт из памяти будущих моделей, на поиск не влияет (информ.) | В |
 | I05 | CDN/WAF не режет ботов: запрос с UA каждого бота (OAI-SearchBot, PerplexityBot, Claude-SearchBot, Google-Agent) → 200, а не 403 или капча | HTTP с подменой UA (приблизительно: настоящих ботов проверяют по IP) | 403 / челлендж → **критично** (Cloudflare блокирует ИИ-ботов по умолчанию на новых доменах с 07.2025) | В |
 | I06 | Контент и разметка в исходном HTML без JS | доля текста в сыром HTML к отрендеренному; JSON-LD есть до выполнения скриптов | ≥ 90 % (GPTBot, ClaudeBot, PerplexityBot не исполняют JS); разметка только после скриптов → внимание | В |
 | I07 | Ключевые факты текстом, а не картинкой, PDF или iframe (цены, адрес, часы, телефон) | DOM + OCR картинок (npud `/v1/ocr`) | факты только на картинке → флаг | В |

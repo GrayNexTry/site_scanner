@@ -85,11 +85,50 @@ fn insecure_config() -> ClientConfig {
         .with_no_client_auth()
 }
 
-async fn handshake(host: &str, cfg: ClientConfig) -> Result<(Option<Vec<u8>>, Option<String>), String> {
-    let tcp = timeout(Duration::from_secs(8), TcpStream::connect((host, 443)))
-        .await
-        .map_err(|_| "таймаут подключения".to_string())?
-        .map_err(|e| format!("подключение: {e}"))?;
+/// TCP-соединение с хостом: с `iface` — привязкой к интерфейсу мимо VPN-туннеля (SO_BINDTODEVICE,
+/// как у загрузчика страниц), без него — обычным маршрутом.
+async fn connect(host: &str, iface: Option<&str>) -> Result<TcpStream, String> {
+    let Some(iface) = iface else {
+        return timeout(Duration::from_secs(8), TcpStream::connect((host, 443)))
+            .await
+            .map_err(|_| "таймаут подключения".to_string())?
+            .map_err(|e| format!("подключение: {e}"));
+    };
+    let addrs: Vec<std::net::SocketAddr> =
+        tokio::net::lookup_host((host, 443)).await.map_err(|e| format!("подключение: {e}"))?.collect();
+    let mut last = "подключение: адрес не найден".to_string();
+    // IPv4 первым: у привязанного Wi-Fi часто нет маршрута IPv6.
+    for addr in addrs.iter().filter(|a| a.is_ipv4()).chain(addrs.iter().filter(|a| a.is_ipv6())) {
+        let sock = if addr.is_ipv4() { tokio::net::TcpSocket::new_v4() } else { tokio::net::TcpSocket::new_v6() };
+        let sock = sock.and_then(|s| s.bind_device(Some(iface.as_bytes())).map(|_| s)).map_err(|e| format!("подключение: {e}"))?;
+        match timeout(Duration::from_secs(8), sock.connect(*addr)).await {
+            Ok(Ok(tcp)) => return Ok(tcp),
+            Ok(Err(e)) => last = format!("подключение: {e}"),
+            Err(_) => last = "таймаут подключения".to_string(),
+        }
+    }
+    Err(last)
+}
+
+/// Ошибка про сам сертификат (а не про сеть): повтор другим маршрутом её не изменит.
+fn is_cert_error(e: &str) -> bool {
+    e.to_lowercase().contains("certificate")
+}
+
+/// Рукопожатие мимо VPN, а не вышло по сетевой причине — обычным маршрутом (как запасной путь
+/// загрузчика страниц). Через туннель белорусские и российские серверы часто рвут рукопожатие
+/// (belodent.by: «tls handshake eof»), а у посетителей в стране сайт открывается.
+async fn handshake(host: &str, cfg: ClientConfig, iface: Option<&str>) -> Result<(Option<Vec<u8>>, Option<String>), String> {
+    match handshake_via(host, cfg.clone(), iface).await {
+        Err(e) if iface.is_some() && !is_cert_error(&e) => {
+            handshake_via(host, cfg, None).await.map_err(|e2| if is_cert_error(&e2) { e2 } else { e })
+        }
+        r => r,
+    }
+}
+
+async fn handshake_via(host: &str, cfg: ClientConfig, iface: Option<&str>) -> Result<(Option<Vec<u8>>, Option<String>), String> {
+    let tcp = connect(host, iface).await?;
     let name = ServerName::try_from(host.to_string()).map_err(|e| e.to_string())?;
     let stream = timeout(Duration::from_secs(8), TlsConnector::from(Arc::new(cfg)).connect(name, tcp))
         .await
@@ -109,7 +148,8 @@ fn fill_cert(info: &mut TlsInfo, der: &[u8]) {
     if let Ok((_, cert)) = x509_parser::parse_x509_certificate(der) {
         let na = cert.validity().not_after.timestamp();
         info.not_after = Some(na);
-        info.days_left = Some((na - chrono::Utc::now().timestamp()).div_euclid(86_400));
+        // Целые сутки к нулю: истёк 21,6 дня назад — «21 дн.», а не «22» (pushkina20.by).
+        info.days_left = Some((na - chrono::Utc::now().timestamp()) / 86_400);
         info.issuer = cert
             .issuer()
             .iter_organization()
@@ -153,9 +193,10 @@ fn name_matches(name: &str, host: &str) -> bool {
     }
 }
 
-pub async fn probe(host: &str) -> TlsInfo {
+/// `iface` — интерфейс мимо VPN, тот же, что у загрузчика страниц (`Fetcher::interface`).
+pub async fn probe(host: &str, iface: Option<&str>) -> TlsInfo {
     let mut info = TlsInfo::default();
-    match handshake(host, verified_config()).await {
+    match handshake(host, verified_config(), iface).await {
         Ok((der, proto)) => {
             info.valid = true;
             info.protocol = proto;
@@ -165,7 +206,7 @@ pub async fn probe(host: &str) -> TlsInfo {
         }
         Err(e) => {
             let mut names = Vec::new();
-            if let Ok((der, proto)) = handshake(host, insecure_config()).await {
+            if let Ok((der, proto)) = handshake(host, insecure_config(), iface).await {
                 info.protocol = proto;
                 if let Some(d) = der {
                     fill_cert(&mut info, &d);

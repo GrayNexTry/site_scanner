@@ -23,11 +23,15 @@ pub struct MetricResult {
     pub value: Option<serde_json::Value>,
     /// Пояснение для человека: что именно найдено.
     pub detail: String,
+    /// Метрики раздела A: на какой карте проверена карточка, если Google и Яндекса среди источников нет
+    /// («OpenStreetMap», «Overture Maps»). Клиентские формулировки называют эту карту, а не «карту» вообще.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub maps: Option<String>,
 }
 
 impl MetricResult {
     pub fn new(id: &str, status: Status, detail: impl Into<String>) -> Self {
-        Self { id: id.to_string(), status, value: None, detail: detail.into() }
+        Self { id: id.to_string(), status, value: None, detail: detail.into(), maps: None }
     }
     pub fn pass(id: &str, detail: impl Into<String>) -> Self {
         Self::new(id, Status::Pass, detail)

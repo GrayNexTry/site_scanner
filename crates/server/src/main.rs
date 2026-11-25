@@ -4,6 +4,7 @@
 //! Проверка одного сайта из консоли: `maps-seo-scanner audit <url> [--country de] …`.
 //! Данные — в $XDG_DATA_HOME/maps-seo-scanner (по умолчанию ~/.local/share/maps-seo-scanner).
 
+mod ai;
 mod api;
 mod assets;
 mod cli_audit;
@@ -103,6 +104,7 @@ async fn main() -> anyhow::Result<()> {
             }
         });
     }
+    api::set_self_url(cli.listen);
     let app = api::router(state);
     let listener = tokio::net::TcpListener::bind(cli.listen).await.with_context(|| format!("порт {} занят?", cli.listen))?;
     let url = format!("http://{}", cli.listen);

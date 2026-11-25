@@ -42,6 +42,29 @@ pub struct Settings {
     /// Сайты — напрямую через Wi-Fi/Ethernet, мимо VPN-туннеля (быстрее, без гео-блоков для сайтов
     /// своей страны); не открылся напрямую — повтор через VPN. Без VPN ничего не меняет.
     pub direct_network: bool,
+    /// Профиль менеджера: подпись и первое сообщение клиенту.
+    pub manager_name: String,
+    pub manager_email: String,
+    pub manager_phone: String,
+    pub manager_telegram: String,
+    pub company_name: String,
+    /// Своя первая фраза; пусто — по категории («Я делаю сайты и SEO для клиник»).
+    pub intro: String,
+    /// Валюта цен по умолчанию: BYN, RUB, USD, EUR, GBP, PLN…
+    pub currency: String,
+    /// Прайс на пакеты работ (КП): `{id, title, price, enabled}`.
+    pub price_list: Vec<scanner_core::sales::PriceItem>,
+    /// Отдельные прайсы для других валют КП: `{"GBP": [{id, title, price, enabled}, …]}`. Курсом цены не пересчитываются;
+    /// для валюты без записи здесь используются встроенные ориентиры GBP/USD/EUR (их стоит поправить под себя).
+    pub price_lists: std::collections::BTreeMap<String, Vec<scanner_core::sales::PriceItem>>,
+    /// Ключ OpenRouter (секрет): нейросеть для писем клиентам.
+    pub openrouter_key: String,
+    /// Профили нейросети: модель, инструкция, шаблоны запроса, рассуждение и все параметры генерации.
+    pub ai_profiles: Vec<scanner_core::llm::AiProfile>,
+    /// Профиль по умолчанию (id).
+    pub ai_profile: String,
+    /// Сколько писем составлять одновременно при массовой генерации (у бесплатных моделей — 20 запросов в минуту).
+    pub ai_concurrency: usize,
 }
 
 impl Default for Settings {
@@ -68,11 +91,24 @@ impl Default for Settings {
             proxy_url: String::new(),
             proxy_always: false,
             direct_network: true,
+            manager_name: String::new(),
+            manager_email: String::new(),
+            manager_phone: String::new(),
+            manager_telegram: String::new(),
+            company_name: String::new(),
+            intro: String::new(),
+            currency: "BYN".into(),
+            price_list: scanner_core::sales::default_price_list(),
+            price_lists: Default::default(),
+            openrouter_key: String::new(),
+            ai_profiles: vec![scanner_core::llm::AiProfile::default()],
+            ai_profile: "default".into(),
+            ai_concurrency: 2,
         }
     }
 }
 
-const KEY_FIELDS: &[&str] = &["google_places_key", "yandex_geosearch_key", "psi_key", "safe_browsing_key", "brave_search_key", "yandex_search_key", "proxy_url"];
+const KEY_FIELDS: &[&str] = &["google_places_key", "yandex_geosearch_key", "psi_key", "safe_browsing_key", "brave_search_key", "yandex_search_key", "proxy_url", "openrouter_key"];
 
 fn mask(k: &str) -> Value {
     let tail: String = k.chars().rev().take(4).collect::<Vec<_>>().into_iter().rev().collect();
@@ -80,6 +116,18 @@ fn mask(k: &str) -> Value {
 }
 
 impl Settings {
+    /// Профиль менеджера для подписи и первого сообщения.
+    pub fn manager(&self) -> scanner_core::sales::Manager {
+        scanner_core::sales::Manager {
+            name: self.manager_name.clone(),
+            email: self.manager_email.clone(),
+            phone: self.manager_phone.clone(),
+            telegram: self.manager_telegram.clone(),
+            company: self.company_name.clone(),
+            intro: self.intro.clone(),
+        }
+    }
+
     /// Настройки загрузчика: таймаут и свой прокси.
     pub fn fetch_config(&self) -> scanner_core::http::FetchConfig {
         scanner_core::http::FetchConfig {
@@ -97,6 +145,18 @@ impl Settings {
             return None;
         }
         scanner_core::render::find_browser(Some(self.browser_path.as_str()).filter(|p| !p.trim().is_empty()))
+    }
+
+    /// Профиль нейросети: по id, иначе профиль по умолчанию, иначе первый.
+    pub fn ai_profile(&self, id: Option<&str>) -> scanner_core::llm::AiProfile {
+        let want = id.map(str::trim).filter(|s| !s.is_empty()).unwrap_or(&self.ai_profile);
+        self.ai_profiles
+            .iter()
+            .find(|p| p.id == want)
+            .or_else(|| self.ai_profiles.iter().find(|p| p.id == self.ai_profile))
+            .or(self.ai_profiles.first())
+            .cloned()
+            .unwrap_or_default()
     }
 
     pub fn search_config(&self) -> scanner_core::search::SearchConfig {
@@ -135,6 +195,39 @@ impl Settings {
         key("yandex_folder_id", &mut self.yandex_folder_id);
         key("browser_path", &mut self.browser_path);
         key("proxy_url", &mut self.proxy_url);
+        key("manager_name", &mut self.manager_name);
+        key("manager_email", &mut self.manager_email);
+        key("manager_phone", &mut self.manager_phone);
+        key("manager_telegram", &mut self.manager_telegram);
+        key("company_name", &mut self.company_name);
+        key("intro", &mut self.intro);
+        key("openrouter_key", &mut self.openrouter_key);
+        if let Some(list) = patch.get("ai_profiles").and_then(|v| serde_json::from_value::<Vec<scanner_core::llm::AiProfile>>(v.clone()).ok()) {
+            self.ai_profiles = scanner_core::llm::normalize_profiles(&list);
+        }
+        if let Some(id) = patch.get("ai_profile").and_then(Value::as_str) {
+            self.ai_profile = id.trim().to_string();
+        }
+        // Профиль по умолчанию — из списка; удалили — первый.
+        if !self.ai_profiles.iter().any(|p| p.id == self.ai_profile) {
+            self.ai_profile = self.ai_profiles.first().map(|p| p.id.clone()).unwrap_or_default();
+        }
+        if let Some(c) = patch.get("currency").and_then(Value::as_str) {
+            let c = c.trim().to_uppercase();
+            if (3..=5).contains(&c.chars().count()) && c.chars().all(|x| x.is_alphabetic()) {
+                self.currency = c;
+            }
+        }
+        if let Some(items) = patch.get("price_list").and_then(|v| serde_json::from_value::<Vec<scanner_core::sales::PriceItem>>(v.clone()).ok()) {
+            self.price_list = scanner_core::sales::normalize_price_list(&items);
+        }
+        if let Some(map) = patch.get("price_lists").and_then(|v| serde_json::from_value::<std::collections::BTreeMap<String, Vec<scanner_core::sales::PriceItem>>>(v.clone()).ok()) {
+            self.price_lists = map
+                .into_iter()
+                .map(|(k, v)| (k.trim().to_uppercase(), scanner_core::sales::normalize_price_list(&v)))
+                .filter(|(k, _)| (3..=5).contains(&k.chars().count()))
+                .collect();
+        }
         let num = |name: &str, lo: u64, hi: u64| patch.get(name).and_then(Value::as_u64).map(|x| x.clamp(lo, hi));
         if let Some(x) = num("max_pages", 1, 200) {
             self.max_pages = x as usize;
@@ -150,6 +243,9 @@ impl Settings {
         }
         if let Some(x) = num("timeout_secs", 5, 60) {
             self.timeout_secs = x;
+        }
+        if let Some(x) = num("ai_concurrency", 1, 8) {
+            self.ai_concurrency = x as usize;
         }
         let flag = |name: &str, target: &mut bool| {
             if let Some(b) = patch.get(name).and_then(Value::as_bool) {
@@ -186,5 +282,26 @@ mod tests {
         s.apply(&json!({"proxy_url": "socks5h://user:pass@10.0.0.2:1080"}));
         assert!(!s.public().to_string().contains("pass"), "пароль прокси наружу не отдаём");
         assert!(s.fetch_config().proxy.is_some());
+        // Профиль менеджера и прайс: прайс дополняется умолчаниями, валюта — трёхбуквенный код.
+        assert_eq!((s.manager_email.as_str(), s.currency.as_str(), s.price_list.len()), ("", "BYN", 15));
+        s.apply(&json!({"manager_name": " Никита ", "currency": "usd", "price_list": [{"id": "https", "title": "", "price": 99, "enabled": false}]}));
+        assert_eq!((s.manager_name.as_str(), s.currency.as_str(), s.price_list.len()), ("Никита", "USD", 15));
+        assert_eq!(s.price_list.iter().find(|p| p.id == "https").map(|p| (p.price, p.enabled)), Some((99.0, false)));
+        s.apply(&json!({"currency": "доллар!", "price_list": "мусор"}));
+        assert_eq!((s.currency.as_str(), s.price_list.len()), ("USD", 15));
+
+        // Нейросеть: ключ — секрет, профили нормализуются, профиль по умолчанию — из списка.
+        s.apply(&json!({"openrouter_key": "sk-or-v1-SECRETabcd"}));
+        assert!(!s.public().to_string().contains("SECRET"));
+        assert_eq!(s.public()["openrouter_key"]["hint"], "••••abcd");
+        assert_eq!((s.ai_profiles.len(), s.ai_profile.as_str()), (1, "default"));
+        s.apply(&json!({"ai_profiles": [{"id": "fast", "name": "Быстрый", "model": "x/y"}, {"id": "fast", "name": "Копия"}], "ai_profile": "nope", "ai_concurrency": 99}));
+        assert_eq!(s.ai_profiles.iter().map(|p| p.id.as_str()).collect::<Vec<_>>(), vec!["fast", "fast-2"]);
+        assert_eq!((s.ai_profile.as_str(), s.ai_concurrency), ("fast", 8), "неизвестный профиль → первый; параллельность ограничена");
+        assert_eq!(s.ai_profile(Some("fast-2")).name, "Копия");
+        assert_eq!(s.ai_profile(Some("нет такого")).id, "fast");
+        assert_eq!(s.ai_profiles[0].system, scanner_core::llm::DEFAULT_SYSTEM, "поля, которых нет в патче, — по умолчанию");
+        s.apply(&json!({"ai_profiles": []}));
+        assert_eq!((s.ai_profiles.len(), s.ai_profile.as_str()), (1, "default"), "пустой список → профиль по умолчанию");
     }
 }
