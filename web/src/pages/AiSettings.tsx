@@ -2,7 +2,7 @@
 // параметры генерации, провайдеры и свои поля запроса. Проверка правок на живой компании до сохранения.
 import { useEffect, useMemo, useState, type ReactNode } from "react";
 import { useMutation, useQuery } from "@tanstack/react-query";
-import { api, type AiKind, type AiModel, type AiPreview, type AiProfile, type Message } from "../api";
+import { aiInfo, api, type AiKind, type AiModel, type AiPreview, type AiProfile, type Message } from "../api";
 import { ConfirmButton } from "../components";
 import { copyText, fmtMs } from "../format";
 import { fmtCost, RequestView } from "./AiDraft";
@@ -264,6 +264,7 @@ function TryOnBusiness({ profile }: { profile: AiProfile }) {
   const showReq = useMutation({ mutationFn: () => api.aiPreview(id, { kind, profile }), onSuccess: (p) => { setPreview(p); setDraft(null); } });
   const gen = useMutation({ mutationFn: () => api.createDraft(id, { kind, profile }), onSuccess: (m) => { setDraft(m); setPreview(null); } });
   const ok = Number.isInteger(id) && id > 0;
+  const info = draft ? aiInfo(draft) : null;
   return (
     <div className="stack" style={{ gap: 8, border: "1px solid var(--line)", borderRadius: 8, padding: 12 }}>
       <b className="small">Проверить профиль на компании — с несохранёнными правками</b>
@@ -290,15 +291,15 @@ function TryOnBusiness({ profile }: { profile: AiProfile }) {
       {draft && (
         <div className="stack" style={{ gap: 6 }}>
           <span className="small faint">
-            {draft.ai?.model} · {fmtMs(draft.ai?.ms)} · {fmtCost(draft.ai?.cost)} · токены {draft.ai?.usage.prompt} + {draft.ai?.usage.completion}
+            {info?.model} · {fmtMs(info?.ms)} · {fmtCost(info?.cost)} · токены {info?.usage.prompt} + {info?.usage.completion}
           </span>
           {draft.subject && <div className="small"><b>Тема:</b> {draft.subject}</div>}
           <div className="small" style={{ whiteSpace: "pre-wrap" }}>{draft.body}</div>
-          {(draft.ai?.lint ?? []).length > 0 && <ul className="small st-warn" style={{ margin: 0, paddingLeft: 18 }}>{draft.ai?.lint.map((x) => <li key={x}>{x}</li>)}</ul>}
-          {draft.ai?.reasoning && (
+          {(info?.lint ?? []).length > 0 && <ul className="small st-warn" style={{ margin: 0, paddingLeft: 18 }}>{info?.lint.map((x) => <li key={x}>{x}</li>)}</ul>}
+          {info?.reasoning && (
             <details>
               <summary className="small">Ход рассуждения</summary>
-              <div className="small muted" style={{ whiteSpace: "pre-wrap", maxHeight: 300, overflow: "auto" }}>{draft.ai.reasoning}</div>
+              <div className="small muted" style={{ whiteSpace: "pre-wrap", maxHeight: 300, overflow: "auto" }}>{info.reasoning}</div>
             </details>
           )}
         </div>

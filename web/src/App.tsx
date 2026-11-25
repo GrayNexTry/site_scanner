@@ -10,6 +10,7 @@ import SettingsPage from "./pages/SettingsPage";
 import LeadsPage from "./pages/LeadsPage";
 import ReportPage from "./pages/ReportPage";
 import ProposalPage from "./pages/ProposalPage";
+import MailPage from "./pages/Mail";
 
 function Logo() {
   return (
@@ -44,6 +45,7 @@ function Shell() {
           <NavLink to="/" end>Сканы</NavLink>
           <NavLink to="/new">Новый скан</NavLink>
           <NavLink to="/leads">Лиды</NavLink>
+          <NavLink to="/mail">Рассылка</NavLink>
           <NavLink to="/catalog">Метрики</NavLink>
           <NavLink to="/settings">Настройки</NavLink>
         </nav>
@@ -65,6 +67,7 @@ function Shell() {
           <Route path="/leads" element={<LeadsPage />} />
           <Route path="/catalog" element={<CatalogPage />} />
           <Route path="/settings" element={<SettingsPage />} />
+          <Route path="/mail" element={<MailPage />} />
           <Route path="*" element={<div className="page"><h1>Страница не найдена</h1></div>} />
         </Routes>
       </main>

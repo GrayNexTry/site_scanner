@@ -63,6 +63,8 @@ pub struct Batch {
     pub errors: Vec<BatchIssue>,
     /// Компании, для которых составлен черновик.
     pub drafted: Vec<i64>,
+    /// Поставлено в рассылку (опция «сразу в рассылку»).
+    pub queued: usize,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -153,7 +155,7 @@ struct Prepared {
 /// Почему для компании письмо не составить (не ошибка нейросети).
 struct NotReady(String);
 
-async fn prepare(st: &Shared, b: &BusinessRow) -> anyhow::Result<Result<Prepared, NotReady>> {
+async fn prepare(st: &Shared, b: &BusinessRow, kind: Kind) -> anyhow::Result<Result<Prepared, NotReady>> {
     let scan = st.db.get_scan(b.scan_id).await?;
     let s = st.settings.read().await.clone();
     let ctx = LeadCtx::new(b, scan.as_ref(), &s);
@@ -188,6 +190,8 @@ async fn prepare(st: &Shared, b: &BusinessRow) -> anyhow::Result<Result<Prepared
         contact_person: b.contact_person.as_deref(),
         notes: b.notes.as_deref(),
         manager: &ctx.manager,
+        // PDF-разбор прикладывается к письму из рассылки, если сайт есть (у «сайта нет» разбирать нечего).
+        attach: kind == Kind::Email && s.mail_attach_report && !facts.no_site,
     });
     let must = [s.manager_email.trim()].into_iter().filter(|e| !e.is_empty()).map(str::to_string).collect();
     Ok(Ok(Prepared { vars, lang, must }))
@@ -226,7 +230,7 @@ async fn pick_profile(st: &Shared, r: &DraftReq) -> AiProfile {
 
 async fn preview(State(st): State<Shared>, Path(id): Path<i64>, Json(r): Json<DraftReq>) -> ApiResult<Json<Value>> {
     let b = st.db.get_business(id).await?.ok_or_else(not_found)?;
-    let prep = prepare(&st, &b).await?.map_err(|n| bad(format!("Для этой компании письмо не составить: {}.", n.0)))?;
+    let prep = prepare(&st, &b, r.kind).await?.map_err(|n| bad(format!("Для этой компании письмо не составить: {}.", n.0)))?;
     let profile = pick_profile(&st, &r).await;
     let caps = caps(&st, &profile.model).await;
     let built = llm::build_request(&profile, r.kind, &prep.vars, caps.as_ref());
@@ -274,7 +278,7 @@ fn daily_limit(e: &AiError) -> bool {
 /// Составить черновик для компании и сохранить его. Сбои провайдера и лимит частоты — до трёх попыток.
 async fn generate(st: &Shared, bid: i64, kind: Kind, profile: &AiProfile, cancel: Option<&AtomicBool>) -> Result<Message, GenError> {
     let b = st.db.get_business(bid).await?.ok_or_else(|| GenError::NotReady("компания не найдена".into()))?;
-    let prep = prepare(st, &b).await?.map_err(|n| GenError::NotReady(n.0))?;
+    let prep = prepare(st, &b, kind).await?.map_err(|n| GenError::NotReady(n.0))?;
     if profile.model.trim().is_empty() {
         return Err(GenError::Ai(AiError { status: 400, message: "В профиле нейросети не выбрана модель.".into(), retry_after: None }));
     }
@@ -368,6 +372,9 @@ struct BatchReq {
     /// Не составлять, если у компании уже есть письмо этого вида (черновик или отправленное).
     #[serde(default = "yes")]
     skip_existing: bool,
+    /// Составленное письмо сразу поставить в рассылку (если у компании есть почта).
+    #[serde(default)]
+    enqueue: bool,
 }
 
 fn yes() -> bool {
@@ -429,7 +436,8 @@ async fn batch_start(State(st): State<Shared>, Json(r): Json<BatchReq>) -> ApiRe
         }
     });
     let st2 = st.clone();
-    tokio::spawn(async move { run_batch(st2, ids, r.kind, profile, r.skip_existing, conc).await });
+    let enqueue = r.enqueue && r.kind == Kind::Email;
+    tokio::spawn(async move { run_batch(st2, ids, r.kind, profile, r.skip_existing, conc, enqueue).await });
     Ok(Json(batch_snapshot(&st)))
 }
 
@@ -440,7 +448,7 @@ fn push_issue(b: &mut Batch, issue: BatchIssue) {
     }
 }
 
-async fn run_batch(st: Shared, ids: Vec<i64>, kind: Kind, profile: AiProfile, skip_existing: bool, conc: usize) {
+async fn run_batch(st: Shared, ids: Vec<i64>, kind: Kind, profile: AiProfile, skip_existing: bool, conc: usize, enqueue: bool) {
     let t = Instant::now();
     let existing = if skip_existing { st.db.with_messages(kind.as_str(), ids.clone()).await.unwrap_or_default() } else { HashSet::new() };
     let sem = Arc::new(Semaphore::new(conc));
@@ -465,11 +473,20 @@ async fn run_batch(st: Shared, ids: Vec<i64>, kind: Kind, profile: AiProfile, sk
             let r = generate(&st, id, kind, &profile, Some(&cancel)).await;
             let name = st.db.get_business(id).await.ok().flatten().map(|b| crate::api::client_name(&b)).unwrap_or_else(|| format!("#{id}"));
             match r {
-                Ok(m) => with_batch(&st, |b| {
-                    b.done += 1;
-                    b.cost += m.ai["cost"].as_f64().unwrap_or(0.0);
-                    b.drafted.push(id);
-                }),
+                Ok(m) => {
+                    // «Сразу в рассылку»: адрес — первая почта компании (не для вакансий).
+                    let queued = if enqueue { crate::mail::enqueue_draft(&st, id, m.id).await } else { Ok(()) };
+                    with_batch(&st, |b| {
+                        b.done += 1;
+                        b.cost += m.ai["cost"].as_f64().unwrap_or(0.0);
+                        b.drafted.push(id);
+                        match queued {
+                            Ok(()) if enqueue => b.queued += 1,
+                            Ok(()) => {}
+                            Err(why) => push_issue(b, BatchIssue { id, name, error: format!("черновик есть, в рассылку не поставлен: {why}"), skipped: true }),
+                        }
+                    })
+                }
                 Err(GenError::NotReady(why)) => with_batch(&st, |b| {
                     b.skipped += 1;
                     push_issue(b, BatchIssue { id, name, error: why, skipped: true });

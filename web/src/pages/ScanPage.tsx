@@ -3,6 +3,7 @@ import { Link, useNavigate, useParams } from "react-router";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { api, type Business, type Lead, type ScanOverview, type SiteState } from "../api";
 import { AiBatchBar } from "./AiDraft";
+import { MailQueueBar } from "./Mail";
 import { CardLinks, ConfirmButton, Empty, LeadBadge, Progress, ScanStatus, ScoreBar } from "../components";
 import { useScanEvents } from "../hooks";
 import { ResultsMap } from "../map";
@@ -186,6 +187,15 @@ export default function ScanPage() {
   const togglePick = (p: Pick) => setPicks((x) => (x.includes(p) ? x.filter((y) => y !== p) : [...x, p]));
   const [siteState, setSiteState] = useState<SiteState | null>(null);
   const [limit, setLimit] = useState(PAGE);
+  // Выбранные компании — для писем нейросетью и рассылки; без выбора действия идут по всем показанным.
+  const [sel, setSel] = useState<Set<number>>(new Set());
+  useEffect(() => setSel(new Set()), [id]);
+  const toggleSel = (bid: number) => setSel((s) => {
+    const n = new Set(s);
+    if (n.has(bid)) n.delete(bid);
+    else n.add(bid);
+    return n;
+  });
   const overviewQ = useQuery({
     queryKey: ["overview", id],
     queryFn: () => api.overview(id),
@@ -355,7 +365,19 @@ export default function ScanPage() {
         {scan.kind === "map" && <button className="btn" onClick={() => setShowMap((v) => !v)}>{showMap ? "Скрыть карту" : "Показать карту"}</button>}
       </div>
 
-      {list.length > 0 && <div className="row"><AiBatchBar items={shown.filter((b) => b.audit_status === "done").map((b) => ({ id: b.id, hasContacts: matchesPick(b, "contacts") }))} /></div>}
+      {list.length > 0 && (() => {
+        const targets = sel.size ? list.filter((b) => sel.has(b.id)) : shown.filter((b) => b.audit_status === "done");
+        const label = sel.size ? `выбрано ${sel.size}` : `все показанные (${targets.length})`;
+        return (
+          <div className="row">
+            <span className="small muted">{sel.size ? `Выбрано: ${sel.size}` : "Отметьте компании галочками — или действия пойдут по всем показанным"}</span>
+            {sel.size > 0 && <button type="button" className="btn btn-sm btn-ghost" onClick={() => setSel(new Set())}>Снять выбор</button>}
+            <span className="spacer" />
+            <AiBatchBar items={targets.map((b) => ({ id: b.id, hasContacts: matchesPick(b, "contacts") }))} />
+            <MailQueueBar ids={targets.map((b) => b.id)} label={label} />
+          </div>
+        );
+      })()}
 
       <div className={showMap && scan.kind === "map" ? "split" : ""}>
         <div className="card">
@@ -378,6 +400,21 @@ export default function ScanPage() {
               <table className="table">
                 <thead>
                   <tr>
+                    <th style={{ width: 34 }}>
+                      <input
+                        type="checkbox"
+                        aria-label="Выбрать все показанные"
+                        checked={shown.length > 0 && shown.every((b) => sel.has(b.id))}
+                        onChange={(e) => {
+                          const on = e.target.checked;
+                          setSel((s) => {
+                            const n = new Set(s);
+                            for (const b of shown) if (on) n.add(b.id); else n.delete(b.id);
+                            return n;
+                          });
+                        }}
+                      />
+                    </th>
                     <th>Компания</th>
                     <th>Сайт</th>
                     <th>Лид</th>
@@ -396,6 +433,9 @@ export default function ScanPage() {
                       onClick={() => nav(`/businesses/${b.id}`)}
                       onMouseEnter={() => setSelected(b.id)}
                     >
+                      <td onClick={(e) => e.stopPropagation()}>
+                        <input type="checkbox" checked={sel.has(b.id)} onChange={() => toggleSel(b.id)} aria-label={`Выбрать: ${b.name}`} />
+                      </td>
                       <td className="cell-name">
                         <Link to={`/businesses/${b.id}`} onClick={(e) => e.stopPropagation()}>{b.name}</Link>
                         <div className="small muted">{[b.category, b.address].filter(Boolean).join(" · ")}</div>

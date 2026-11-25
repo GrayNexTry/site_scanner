@@ -4,8 +4,9 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { api, type KeyState, type Settings } from "../api";
 import { useToast } from "../components";
 import { AiSettingsCard } from "./AiSettings";
+import { MailSettingsCard } from "./Mail";
 
-type KeyField = "google_places_key" | "yandex_geosearch_key" | "psi_key" | "safe_browsing_key" | "brave_search_key" | "yandex_search_key" | "proxy_url" | "openrouter_key";
+type KeyField = "google_places_key" | "yandex_geosearch_key" | "psi_key" | "safe_browsing_key" | "brave_search_key" | "yandex_search_key" | "proxy_url" | "openrouter_key" | "smtp_password";
 
 const KEYS: { id: KeyField; label: string; how: string }[] = [
   { id: "google_places_key", label: "Google Places API (New)", how: "Google Cloud Console → APIs & Services → включить «Places API (New)» → Credentials → API key. Нужен платёжный аккаунт; бесплатный лимит есть." },
@@ -56,7 +57,7 @@ export default function SettingsPage() {
   const { hash } = useLocation();
   const loaded = !!q.data;
   useEffect(() => {
-    if (hash === "#ai" && loaded) document.getElementById("ai")?.scrollIntoView({ block: "start" });
+    if ((hash === "#ai" || hash === "#mail") && loaded) document.getElementById(hash.slice(1))?.scrollIntoView({ block: "start" });
   }, [hash, loaded]);
 
   const save = useMutation({
@@ -89,6 +90,24 @@ export default function SettingsPage() {
         ai_profiles: limits.ai_profiles,
         ai_profile: limits.ai_profile,
         ai_concurrency: limits.ai_concurrency,
+        portfolio_url: limits.portfolio_url,
+        about_me: limits.about_me,
+        smtp_host: limits.smtp_host,
+        smtp_port: limits.smtp_port,
+        smtp_security: limits.smtp_security,
+        smtp_user: limits.smtp_user,
+        mail_from_name: limits.mail_from_name,
+        mail_from_email: limits.mail_from_email,
+        mail_reply_to: limits.mail_reply_to,
+        mail_interval_min: limits.mail_interval_min,
+        mail_interval_max: limits.mail_interval_max,
+        mail_daily_limit: limits.mail_daily_limit,
+        mail_window_start: limits.mail_window_start,
+        mail_window_end: limits.mail_window_end,
+        mail_weekdays_only: limits.mail_weekdays_only,
+        mail_attach_report: limits.mail_attach_report,
+        mail_footer: limits.mail_footer,
+        mail_footer_en: limits.mail_footer_en,
       };
       for (const [k, v] of Object.entries(keys)) if (v !== undefined) patch[k] = v;
       return api.saveSettings(patch);
@@ -170,6 +189,19 @@ export default function SettingsPage() {
             <div className="field">
               <label htmlFor="intro">Первая фраза сообщения</label>
               <textarea id="intro" className="input" rows={2} placeholder="Пусто — фраза по категории компании («Я делаю сайты и SEO для клиник»)" value={limits.intro ?? ""} onChange={(e) => setLimits((l) => ({ ...l, intro: e.target.value }))} />
+              <span className="hint">Для шаблонного письма. Нейросеть пишет о вас по полям ниже.</span>
+            </div>
+            <div className="grid-2">
+              <div className="field">
+                <label htmlFor="portfolio_url">Портфолио (ссылка)</label>
+                <input id="portfolio_url" className="input" placeholder="https://… — примеры ваших работ" value={limits.portfolio_url ?? ""} onChange={(e) => setLimits((l) => ({ ...l, portfolio_url: e.target.value }))} />
+                <span className="hint">Попадает в подпись письма («Примеры работ: …») и в запрос нейросети.</span>
+              </div>
+              <div className="field">
+                <label htmlFor="about_me">О себе — для нейросети</label>
+                <textarea id="about_me" className="input" rows={3} placeholder="Например: делаю сайты для небольших клиник и салонов в Минске, 4 года; сделал сайты для двух стоматологий" value={limits.about_me ?? ""} onChange={(e) => setLimits((l) => ({ ...l, about_me: e.target.value }))} />
+                <span className="hint">Пара фраз фактами: модель возьмёт из них одну, без громких слов.</span>
+              </div>
             </div>
           </div>
         </div>
@@ -250,6 +282,21 @@ export default function SettingsPage() {
               state={q.data.openrouter_key}
               value={keys.openrouter_key}
               onChange={(v) => setKeys((s) => ({ ...s, openrouter_key: v }))}
+            />
+          }
+        />
+        <MailSettingsCard
+          limits={limits}
+          setLimits={setLimits}
+          passwordInput={
+            <KeyInput
+              id="smtp_password"
+              label="Пароль"
+              how="Пароль приложения почтового сервиса (не основной пароль ящика). Хранится только в локальной базе."
+              state={q.data.smtp_password}
+              value={keys.smtp_password}
+              onChange={(v) => setKeys((s) => ({ ...s, smtp_password: v }))}
+              placeholder="Пароль приложения"
             />
           }
         />

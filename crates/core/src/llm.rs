@@ -154,20 +154,22 @@ impl Default for AiProfile {
     }
 }
 
-pub const DEFAULT_SYSTEM: &str = "Ты пишешь первое сообщение владельцу местного бизнеса от имени специалиста, который делает сайты и занимается SEO. Задача — чтобы человек ответил, а не продать всё в первом же письме.
+pub const DEFAULT_SYSTEM: &str = "Ты помогаешь написать первое письмо владельцу небольшого местного бизнеса. Пишет живой человек, который делает сайты: он заметил на сайте компании конкретные вещи и предлагает помочь. Цель — чтобы человеку было интересно ответить, а не продать с первого письма.
 
-Правила:
-— Язык текста — {{language}}.
-— Коротко, вежливо и по делу: приветствие, одна фраза о себе, главные проблемы, предложение, контакты. Письмо — до 120 слов без подписи, сообщение в мессенджер — до 80 слов.
-— Проблемы бери только из запроса. Не придумывай фактов, цифр, сроков и обещаний вроде «первое место в Google» или «рост продаж на 50 %».
-— Пиши простыми словами, как для владельца бизнеса, без технических терминов (HTTPS, мета-теги, schema, robots.txt, Core Web Vitals и т. п.): что видит клиент компании и чем это мешает.
-— Проблемы — списком, каждая строка начинается с «— ». Без markdown: никаких **, #, ссылок в скобках и эмодзи.
-— От первого лица без глаголов прошедшего времени с родом: не «нашёл», «нашла», «посмотрел», а «нашлось», «вижу», «есть».
-— Без давления и громких слов: без «срочно», «вы теряете деньги», капса и восклицательных знаков подряд.
-— Не пиши, что текст составлен автоматически или нейросетью, не называй программы и сервисы проверки.
-— Имя, компания и контакты отправителя — только те, что даны в запросе; ничего не добавляй от себя.";
+Как писать:
+— Язык — {{language}}. Обращение на «вы».
+— Спокойно и по-человечески, как пишут по делу незнакомому человеку: без рекламных слов («уникальный», «эффективный», «под ключ», «увеличим продажи»), без громких званий («SEO-специалист», «эксперт», «мастер»), без восклицательных знаков.
+— Коротко: письмо — 60–110 слов без подписи, сообщение в мессенджер — 30–60 слов. Обычный связный текст в 2–3 абзаца: без списков, без тире в начале строк, без markdown и эмодзи.
+— Назови одну-две самые заметные проблемы из запроса и одной фразой — чем они мешают клиентам компании. Не перечисляй всё подряд и не пугай («вы теряете клиентов», «срочно»).
+— Только факты из запроса. Не придумывай цифр, сроков, цен, отзывов и обещаний вроде «первое место в поиске».
+— Простые слова вместо терминов: не «HTTPS», «мета-теги», «schema», «Core Web Vitals», а что человек видит на сайте или в поиске.
+— От первого лица без глаголов прошедшего времени с родом (не «нашёл», «посмотрела», «заметил»): пиши «на сайте видно», «есть», «нашлось».
+— Если дана ссылка на примеры работ, скажи о примерах одной фразой, без хвастовства: в письме ссылка уже стоит в подписи — в тексте её не повторяй; в сообщении для мессенджера дай ссылку в тексте. Если ссылки нет — не упоминай портфолио.
+— Предложение — мягкое: «если интересно, расскажу подробнее» или «могу показать, что стоит поправить». Без цены и без давления.
+— Не пиши, что текст составлен автоматически или нейросетью, не называй программ и сервисов проверки.
+— Имя, компания, контакты и ссылки отправителя — только из запроса; ничего не добавляй от себя.";
 
-pub const DEFAULT_EMAIL_PROMPT: &str = "Составь первое письмо компании.
+pub const DEFAULT_EMAIL_PROMPT: &str = "Напиши первое письмо компании.
 
 Компания: {{company}}
 Чем занимается: {{category}}
@@ -175,41 +177,38 @@ pub const DEFAULT_EMAIL_PROMPT: &str = "Составь первое письмо
 Сайт: {{site}}
 Состояние сайта: {{site_state}}
 
-Главные проблемы, о которых стоит написать:
+Что заметно (по важности; возьми одну-две первые):
 {{problems}}
 
-Полный список найденных проблем (главные из него уже выше; остальные упоминай, только если главных меньше двух):
+Что ещё нашлось — только для понимания, в письме не перечисляй:
 {{problems_more}}
 
-Что предложить: {{offer}}
-Пример запроса, по которому клиенты ищут такие компании: {{query}}
-Первая фраза о себе (можно перефразировать): {{intro}}
-В конце письма — подпись, ровно так:
+Кто пишет: {{manager_name}}
+О себе: {{about_me}}
+Примеры работ: {{portfolio}}
+Вложение: {{attachment}}
+
+Подпись в конце письма — ровно так:
 {{signature}}
 
-Образец, который собрал шаблон (сделай живее и убедительнее, но факты бери только из списков выше):
-Тема: {{template_subject}}
-{{template_body}}
+Тема — короткая и спокойная, без восклицаний и кликбейта: о сайте компании или о том, что его нет.
 
-Ответь JSON-объектом без пояснений: {\"subject\": \"тема письма\", \"body\": \"текст письма вместе с подписью\"}.";
+Ответь JSON-объектом без пояснений: {\"subject\": \"тема\", \"body\": \"текст письма с подписью\"}.";
 
-pub const DEFAULT_SHORT_PROMPT: &str = "Составь короткое первое сообщение компании для мессенджера (WhatsApp, Telegram, Instagram).
+pub const DEFAULT_SHORT_PROMPT: &str = "Напиши короткое первое сообщение компании в мессенджер (WhatsApp, Telegram, Instagram).
 
 Компания: {{company}}
 Чем занимается: {{category}}
 Город: {{city}}
 Сайт: {{site}}
-Состояние сайта: {{site_state}}
 
-Главные проблемы, о которых стоит написать:
+Что заметно (возьми одну, максимум две первые):
 {{problems}}
 
-Что предложить: {{offer}}
-Первая фраза о себе (можно перефразировать): {{intro}}
-В конце сообщения — контакты одной строкой, ровно так: {{contact_line}}
-
-Образец, который собрал шаблон (сделай живее, но факты бери только из списков выше):
-{{template_short}}
+Кто пишет: {{manager_name}}
+О себе: {{about_me}}
+Примеры работ: {{portfolio}}
+В конце — контакты одной строкой, ровно так: {{contact_line}}
 
 Ответь JSON-объектом без пояснений: {\"body\": \"текст сообщения\"}.";
 
@@ -230,6 +229,9 @@ pub const VARS: &[(&str, &str)] = &[
     ("good", "Что на сайте в порядке"),
     ("offer", "Что предложить"),
     ("intro", "Первая фраза о себе (из настроек или по категории)"),
+    ("about_me", "О себе — из «Настройки → Профиль»"),
+    ("portfolio", "Ссылка на примеры работ или «нет»"),
+    ("attachment", "Будет ли приложен PDF-разбор сайта (при рассылке по почте)"),
     ("query", "Пример поискового запроса клиентов: «стоматолог Минск»"),
     ("audience", "Кого теряет компания: пациентов, клиентов, гостей"),
     ("contact_person", "Контактное лицо (ЛПР), если указано"),
@@ -321,6 +323,8 @@ pub struct LetterContext<'a> {
     pub contact_person: Option<&'a str>,
     pub notes: Option<&'a str>,
     pub manager: &'a Manager,
+    /// К письму приложится PDF-разбор сайта (рассылка по почте, сайт есть).
+    pub attach: bool,
 }
 
 fn dash_list(items: &[String]) -> String {
@@ -363,6 +367,20 @@ pub fn letter_vars(c: &LetterContext) -> BTreeMap<String, String> {
     let no_sign = if ru { "(подписи нет — ничего не добавляй)" } else { "(no signature — add nothing)" };
     put("signature", if f.signature.is_empty() { no_sign.to_string() } else { f.signature.clone() });
     put("contact_line", if f.contact_line.is_empty() { no_sign.to_string() } else { f.contact_line.clone() });
+    put("about_me", opt(Some(&m.about)).unwrap_or_else(|| none.to_string()));
+    put(
+        "portfolio",
+        opt(Some(&m.portfolio)).unwrap_or_else(|| if ru { "нет (не упоминай портфолио)".into() } else { "none (don't mention a portfolio)".into() }),
+    );
+    put(
+        "attachment",
+        match (c.attach, ru) {
+            (true, true) => "к письму приложится подробный разбор сайта в PDF — можно сослаться на него одной фразой".into(),
+            (true, false) => "a detailed PDF review of the website will be attached — you may mention it in one phrase".into(),
+            (false, true) => "вложений нет — не упоминай их".into(),
+            (false, false) => "no attachments — don't mention any".into(),
+        },
+    );
     put("manager_name", or_unknown(Some(&m.name)));
     put("manager_email", or_unknown(Some(&m.email)));
     put("manager_phone", or_unknown(Some(&m.phone)));
@@ -824,6 +842,7 @@ pub fn lint_letter(l: &Letter, kind: Kind, lang: &str, must_contain: &[String]) 
     static MD: OnceLock<Regex> = OnceLock::new();
     static BRACKETS: OnceLock<Regex> = OnceLock::new();
     static AI: OnceLock<Regex> = OnceLock::new();
+    static LOUD: OnceLock<Regex> = OnceLock::new();
     let mut out: Vec<String> = Vec::new();
     let text = format!("{}\n{}", l.subject, l.body);
     if l.body.trim().is_empty() {
@@ -850,6 +869,9 @@ pub fn lint_letter(l: &Letter, kind: Kind, lang: &str, must_contain: &[String]) 
         if let Some(c) = g.captures(&text) {
             out.push(format!("Глагол с родом от первого лица: «{}» — по правилам лучше «нашлось», «вижу», «есть».", &c[1]));
         }
+    }
+    if let Some(m) = re(r"(?i)seo-специалист|seo-эксперт|\bэксперт\w*|под ключ|уникальн\w*|гарантир\w*|в топ\b|в топе\b|seo expert|guarantee\w*", &LOUD).find(&text) {
+        out.push(format!("Громкие слова: «{}» — тон лучше спокойнее.", m.as_str()));
     }
     if re(r"(?i)нейросет|искусственн\w* интеллект|chatgpt|\bgpt\b|as an ai|ai-generated|language model", &AI).is_match(&text) {
         out.push("Упоминается нейросеть или ИИ.".into());
@@ -987,6 +1009,7 @@ mod tests {
             contact_person: None,
             notes: None,
             manager: &m,
+            attach: true,
         })
     }
 
@@ -999,13 +1022,16 @@ mod tests {
         assert_eq!(v.len(), VARS.len(), "переменная без описания в VARS");
         assert_eq!(v["problems"], "— браузер пишет «Не защищено»\n— главная весит около 15 МБ");
         assert_eq!((v["problems_more"].as_str(), v["address"].as_str(), v["score"].as_str()), ("нет", "не указано", "38"));
+        assert!(v["portfolio"].starts_with("нет") && v["attachment"].contains("PDF"));
+        // Промпт по умолчанию — без списка с тире и без шаблонного письма-образца.
+        assert!(!DEFAULT_EMAIL_PROMPT.contains("template_body") && DEFAULT_SYSTEM.contains("без списков"));
         let p = AiProfile::default();
         for kind in [Kind::Email, Kind::Short] {
             let b = build_request(&p, kind, &v, None);
             assert!(b.unknown_vars.is_empty(), "в шаблоне по умолчанию неизвестные переменные: {:?}", b.unknown_vars);
             let user = b.body["messages"][1]["content"].as_str().unwrap();
             assert!(user.contains("belodent.by") && !user.contains("{{"));
-            assert!(b.body["messages"][0]["content"].as_str().unwrap().contains("Язык текста — русский"));
+            assert!(b.body["messages"][0]["content"].as_str().unwrap().contains("Язык — русский"));
         }
     }
 
@@ -1080,9 +1106,9 @@ mod tests {
         let must = vec!["hello@example.com".to_string()];
         let ok = Letter { subject: "Сайт belodent.by".into(), body: "Здравствуйте! На сайте нашлось несколько проблем:\n— раз\n— два\n\nhello@example.com".into() };
         assert!(lint_letter(&ok, Kind::Email, "ru", &must).is_empty(), "{:?}", lint_letter(&ok, Kind::Email, "ru", &must));
-        let bad = Letter { subject: "".into(), body: "Я внимательно посмотрела ваш **сайт**. С уважением, [Ваше имя]. Пишу как нейросеть {{x}}".into() };
+        let bad = Letter { subject: "".into(), body: "Я внимательно посмотрела ваш **сайт** как SEO-эксперт. С уважением, [Ваше имя]. Пишу как нейросеть {{x}}".into() };
         let issues = lint_letter(&bad, Kind::Email, "ru", &must).join(" | ");
-        for want in ["Нет темы", "посмотрела", "markdown", "[Ваше имя]", "нейросеть", "{{…}}", "hello@example.com"] {
+        for want in ["Нет темы", "посмотрела", "markdown", "[Ваше имя]", "нейросеть", "{{…}}", "hello@example.com", "эксперт"] {
             assert!(issues.contains(want), "нет замечания «{want}»: {issues}");
         }
         // «сделал» про третье лицо — не замечание; «Нашла» в начале предложения — замечание.

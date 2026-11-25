@@ -473,6 +473,11 @@ export interface MessageAi {
   original: { subject: string; body: string };
 }
 
+/** Сведения нейросети о письме; у шаблона и своего текста — null. */
+export function aiInfo(m: { ai: Message["ai"] }): MessageAi | null {
+  return m.ai && "model_requested" in m.ai ? m.ai : null;
+}
+
 export interface Message {
   id: number;
   business_id: number;
@@ -480,12 +485,43 @@ export interface Message {
   updated_at: string | null;
   direction: "out" | "in";
   kind: AiKind;
-  status: "draft" | "sent";
+  /** draft — черновик, queued — в рассылке, sending — уходит, sent — отправлено, failed — не ушло. */
+  status: "draft" | "queued" | "sending" | "sent" | "failed";
   subject: string | null;
   body: string;
-  ai: MessageAi | null;
+  /** Как составлено (у шаблона и своего текста — только source). */
+  ai: MessageAi | { source: string } | null;
   sent_at: string | null;
+  to_addr: string | null;
+  queued_at: string | null;
+  message_id: string | null;
+  error: string | null;
 }
+
+/** Письмо в рассылке с компанией. */
+export interface OutboxRow extends Message {
+  business_name: string;
+  display_name: string | null;
+  scan_id: number;
+  lead_status: LeadStatus;
+}
+
+export interface MailStatus {
+  configured: boolean;
+  running: boolean;
+  from: string;
+  queued: number;
+  failed: number;
+  sent_today: number;
+  daily_limit: number;
+  in_window: boolean;
+  window: { start: number; end: number; weekdays_only: boolean };
+  interval: { min: number; max: number };
+  attach_report: boolean;
+  info: { next_at: string | null; waiting: string | null; stop_reason: string | null; last_error: string | null; sending: number | null };
+}
+
+export type MailSource = "draft" | "template" | "draft_or_template";
 
 export interface AiBatch {
   running: boolean;
@@ -503,6 +539,8 @@ export interface AiBatch {
   stop_reason: string | null;
   errors: { id: number; name: string; error: string; skipped: boolean }[];
   drafted: number[];
+  /** Поставлено в рассылку (опция «сразу в рассылку»). */
+  queued: number;
 }
 
 /** Что отправить вместо сохранённого профиля: несохранённые правки из настроек. */
@@ -587,6 +625,26 @@ export interface Settings {
   price_list: PriceItem[];
   /** Свои прайсы по другим валютам. */
   price_lists?: Record<string, PriceItem[]>;
+  portfolio_url: string;
+  about_me: string;
+  smtp_host: string;
+  smtp_port: number;
+  smtp_security: "ssl" | "starttls" | "plain";
+  smtp_user: string;
+  smtp_password: KeyState;
+  mail_from_name: string;
+  mail_from_email: string;
+  mail_reply_to: string;
+  mail_interval_min: number;
+  mail_interval_max: number;
+  mail_daily_limit: number;
+  mail_window_start: number;
+  mail_window_end: number;
+  mail_weekdays_only: boolean;
+  mail_attach_report: boolean;
+  mail_footer: string;
+  mail_footer_en: string;
+  mail_running: boolean;
   openrouter_key: KeyState;
   ai_profiles: AiProfile[];
   ai_profile: string;
@@ -669,7 +727,16 @@ export const api = {
   patchMessage: (mid: number, body: { subject?: string; body?: string }) => call<Message>(`/messages/${mid}`, { method: "PATCH", body: JSON.stringify(body) }),
   deleteMessage: (mid: number) => call<{ ok: boolean }>(`/messages/${mid}`, { method: "DELETE" }),
   aiBatch: () => call<AiBatch>("/ai/batch"),
-  startAiBatch: (body: { ids: number[]; kind: AiKind; profile_id?: string; skip_existing?: boolean }) => post<AiBatch>("/ai/batch", body),
+  startAiBatch: (body: { ids: number[]; kind: AiKind; profile_id?: string; skip_existing?: boolean; enqueue?: boolean }) => post<AiBatch>("/ai/batch", body),
+  mailStatus: () => call<MailStatus>("/mail/status"),
+  mailStart: () => post<MailStatus>("/mail/start"),
+  mailPause: () => post<MailStatus>("/mail/pause"),
+  mailTest: (to?: string) => post<{ ok: boolean; to: string }>("/mail/test", { to }),
+  outbox: () => call<OutboxRow[]>("/mail/outbox"),
+  queueMail: (body: { ids: number[]; source: MailSource; skip_contacted?: boolean; skip_sent?: boolean }) =>
+    post<{ queued: number; skipped: { id: number; name: string; reason: string }[] }>("/mail/queue", body),
+  queueOne: (id: number, body: { message_id?: number; to: string; subject: string; body: string }) => post<Message>(`/businesses/${id}/mail`, body),
+  unqueue: (mid: number) => post<{ ok: boolean }>(`/messages/${mid}/unqueue`),
   cancelAiBatch: () => post<AiBatch>("/ai/batch/cancel"),
   leadsCsvUrl: "/api/leads.csv",
   exportUrl: (scanId: number) => `/api/scans/${scanId}/export.csv`,

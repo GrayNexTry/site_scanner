@@ -49,6 +49,8 @@ pub struct AppState {
     cancels: Mutex<HashMap<i64, Arc<AtomicBool>>>,
     /// Нейросеть для писем: каталог моделей OpenRouter и массовая генерация.
     pub ai: crate::ai::AiState,
+    /// Рассылка по почте: что ждёт и почему остановилась.
+    pub mail: crate::mail::MailState,
     /// Страна выхода в интернет и когда узнали (VPN меняет её на ходу).
     egress: tokio::sync::Mutex<Option<(Instant, Option<String>)>>,
 }
@@ -101,6 +103,7 @@ impl AppState {
             events,
             cancels: Mutex::new(HashMap::new()),
             ai: crate::ai::AiState::new(ai_base.as_deref())?,
+            mail: Default::default(),
             egress: tokio::sync::Mutex::new(None),
         }))
     }

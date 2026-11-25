@@ -76,7 +76,11 @@ CREATE TABLE IF NOT EXISTS messages (
     subject     TEXT,
     body        TEXT NOT NULL,
     ai          TEXT,
-    sent_at     TEXT
+    sent_at     TEXT,
+    to_addr     TEXT,
+    queued_at   TEXT,
+    message_id  TEXT,
+    error       TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_messages_business ON messages(business_id);
 "#;
@@ -102,7 +106,17 @@ const ADDED_COLUMNS: &[(&str, &str)] = &[
     ("display_address", "TEXT"),
 ];
 
+/// Колонки `messages`, добавленные для рассылки по почте.
+const MESSAGE_ADDED_COLUMNS: &[(&str, &str)] = &[("to_addr", "TEXT"), ("queued_at", "TEXT"), ("message_id", "TEXT"), ("error", "TEXT")];
+
 fn migrate(conn: &Connection) -> rusqlite::Result<()> {
+    let mcols: Vec<String> = conn.prepare("PRAGMA table_info(messages)")?.query_map([], |r| r.get::<_, String>(1))?.collect::<Result<_, _>>()?;
+    for (name, def) in MESSAGE_ADDED_COLUMNS {
+        if !mcols.iter().any(|c| c == name) {
+            conn.execute_batch(&format!("ALTER TABLE messages ADD COLUMN {name} {def}"))?;
+        }
+    }
+    conn.execute_batch("CREATE INDEX IF NOT EXISTS idx_messages_status ON messages(status)")?;
     let existing: Vec<String> =
         conn.prepare("PRAGMA table_info(businesses)")?.query_map([], |r| r.get::<_, String>(1))?.collect::<Result<_, _>>()?;
     for (name, def) in ADDED_COLUMNS {
@@ -145,7 +159,8 @@ pub struct Activity {
     pub text: Option<String>,
 }
 
-/// Сообщение клиенту. `kind`: `email` (тема + письмо) или `short` (мессенджер); `status`: `draft`, `sent`;
+/// Сообщение клиенту. `kind`: `email` (тема + письмо) или `short` (мессенджер); `status`: `draft`, `queued` (в рассылке),
+/// `sending`, `sent`, `failed`; у отправленных рассылкой — `message_id` письма (для ответов) и адрес `to_addr`;
 /// `ai` — как составлено: профиль, модель, запрос, ход рассуждения, токены, цена, замечания проверки.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Message {
@@ -160,9 +175,13 @@ pub struct Message {
     pub body: String,
     pub ai: Value,
     pub sent_at: Option<String>,
+    pub to_addr: Option<String>,
+    pub queued_at: Option<String>,
+    pub message_id: Option<String>,
+    pub error: Option<String>,
 }
 
-const MESSAGE_COLS: &str = "id,business_id,created_at,updated_at,direction,kind,status,subject,body,ai,sent_at";
+const MESSAGE_COLS: &str = "id,business_id,created_at,updated_at,direction,kind,status,subject,body,ai,sent_at,to_addr,queued_at,message_id,error";
 
 fn message_row(r: &rusqlite::Row) -> rusqlite::Result<Message> {
     Ok(Message {
@@ -177,7 +196,22 @@ fn message_row(r: &rusqlite::Row) -> rusqlite::Result<Message> {
         body: r.get(8)?,
         ai: r.get::<_, Option<String>>(9)?.and_then(|s| serde_json::from_str(&s).ok()).unwrap_or(Value::Null),
         sent_at: r.get(10)?,
+        to_addr: r.get(11)?,
+        queued_at: r.get(12)?,
+        message_id: r.get(13)?,
+        error: r.get(14)?,
     })
+}
+
+/// Письмо в рассылке — с компанией, чтобы показать список без лишних запросов.
+#[derive(Debug, Clone, Serialize)]
+pub struct OutboxRow {
+    #[serde(flatten)]
+    pub message: Message,
+    pub business_name: String,
+    pub display_name: Option<String>,
+    pub scan_id: i64,
+    pub lead_status: String,
 }
 
 /// Правки полей работы с лидом. `None` — не трогать; пустая строка / `Some(None)` — очистить.
@@ -962,6 +996,128 @@ impl Db {
                 c.execute("DELETE FROM messages WHERE id=?1", [id])?;
             }
             Ok(bid)
+        })
+        .await
+    }
+
+    /// Последний черновик письма компании (не в рассылке и не отправленный).
+    pub async fn latest_draft(&self, business_id: i64, kind: &'static str) -> anyhow::Result<Option<Message>> {
+        self.call(move |c| {
+            c.query_row(
+                &format!("SELECT {MESSAGE_COLS} FROM messages WHERE business_id=?1 AND kind=?2 AND direction='out' AND status='draft' ORDER BY created_at DESC, id DESC LIMIT 1"),
+                params![business_id, kind],
+                message_row,
+            )
+            .optional()
+        })
+        .await
+    }
+
+    /// Письма компании этого вида в работе рассылки: (в очереди или отправляется, уже отправлено).
+    pub async fn mail_state(&self, business_id: i64) -> anyhow::Result<(bool, bool)> {
+        self.call(move |c| {
+            let queued = c.query_row("SELECT EXISTS(SELECT 1 FROM messages WHERE business_id=?1 AND kind='email' AND status IN ('queued','sending'))", [business_id], |r| r.get(0))?;
+            let sent = c.query_row("SELECT EXISTS(SELECT 1 FROM messages WHERE business_id=?1 AND kind='email' AND status='sent')", [business_id], |r| r.get(0))?;
+            Ok((queued, sent))
+        })
+        .await
+    }
+
+    /// Поставить письмо в рассылку (адрес, текст по желанию); снимает прошлую ошибку.
+    pub async fn queue_message(&self, id: i64, to: String, subject: Option<String>, body: Option<String>) -> anyhow::Result<Option<Message>> {
+        self.call(move |c| {
+            let at = now();
+            let n = c.execute(
+                "UPDATE messages SET status='queued', to_addr=?2, subject=COALESCE(?3,subject), body=COALESCE(?4,body), queued_at=?5, updated_at=?5, error=NULL
+                 WHERE id=?1 AND kind='email' AND status IN ('draft','queued','failed')",
+                params![id, to, subject, body, at],
+            )?;
+            if n == 0 {
+                return Ok(None);
+            }
+            c.query_row(&format!("SELECT {MESSAGE_COLS} FROM messages WHERE id=?1"), [id], message_row).optional()
+        })
+        .await
+    }
+
+    /// Убрать из рассылки обратно в черновики (только ещё не начатые).
+    pub async fn unqueue_message(&self, id: i64) -> anyhow::Result<bool> {
+        self.call(move |c| Ok(c.execute("UPDATE messages SET status='draft', queued_at=NULL, updated_at=?2 WHERE id=?1 AND status IN ('queued','failed')", params![id, now()])? > 0)).await
+    }
+
+    /// Следующее письмо очереди и пометка «отправляется» (чтобы не отправить дважды). None — очередь пуста.
+    pub async fn claim_next_mail(&self) -> anyhow::Result<Option<Message>> {
+        self.call(|c| {
+            let tx = c.transaction()?;
+            let m = tx
+                .query_row(&format!("SELECT {MESSAGE_COLS} FROM messages WHERE status='queued' AND kind='email' ORDER BY queued_at, id LIMIT 1"), [], message_row)
+                .optional()?;
+            if let Some(m) = &m {
+                tx.execute("UPDATE messages SET status='sending', updated_at=?2 WHERE id=?1 AND status='queued'", params![m.id, now()])?;
+            }
+            tx.commit()?;
+            Ok(m)
+        })
+        .await
+    }
+
+    /// Итог отправки: `sent` с Message-ID, `failed` с ошибкой или обратно в очередь (`queued`) с ошибкой.
+    pub async fn finish_mail(&self, id: i64, status: &'static str, message_id: Option<String>, error: Option<String>) -> anyhow::Result<()> {
+        self.call(move |c| {
+            let at = now();
+            let sent_at = (status == "sent").then(|| at.clone());
+            c.execute(
+                "UPDATE messages SET status=?2, message_id=COALESCE(?3,message_id), error=?4, sent_at=COALESCE(?5,sent_at), updated_at=?6 WHERE id=?1",
+                params![id, status, message_id, error, sent_at, at],
+            )
+            .map(|_| ())
+        })
+        .await
+    }
+
+    /// После перезапуска: письма, застрявшие в «отправляется», — неизвестно, ушли ли; помечаются ошибкой.
+    pub async fn recover_sending(&self) -> anyhow::Result<usize> {
+        self.call(|c| {
+            c.execute(
+                "UPDATE messages SET status='failed', error='Сервер остановился во время отправки — проверьте папку «Отправленные», прежде чем повторять' WHERE status='sending'",
+                [],
+            )
+        })
+        .await
+    }
+
+    /// Писем, отправленных рассылкой с момента `since` (RFC3339 UTC).
+    pub async fn mail_sent_since(&self, since: String) -> anyhow::Result<i64> {
+        self.call(move |c| c.query_row("SELECT COUNT(*) FROM messages WHERE status='sent' AND message_id IS NOT NULL AND sent_at>=?1", [since], |r| r.get(0))).await
+    }
+
+    /// Счётчики очереди: в очереди, ошибки.
+    pub async fn mail_counts(&self) -> anyhow::Result<(i64, i64)> {
+        self.call(|c| {
+            c.query_row(
+                "SELECT COALESCE(SUM(status IN ('queued','sending')),0), COALESCE(SUM(status='failed'),0) FROM messages WHERE kind='email'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+        })
+        .await
+    }
+
+    /// Рассылка: очередь, ошибки и отправленное рассылкой (последние 500).
+    pub async fn outbox(&self) -> anyhow::Result<Vec<OutboxRow>> {
+        self.call(|c| {
+            let cols = MESSAGE_COLS.split(',').map(|x| format!("m.{x}")).collect::<Vec<_>>().join(",");
+            let mut st = c.prepare(&format!(
+                "SELECT {cols}, b.name, b.display_name, b.scan_id, b.lead_status FROM messages m JOIN businesses b ON b.id=m.business_id
+                 WHERE m.kind='email' AND (m.status IN ('queued','sending','failed') OR (m.status='sent' AND m.message_id IS NOT NULL))
+                 ORDER BY CASE m.status WHEN 'sending' THEN 0 WHEN 'queued' THEN 1 WHEN 'failed' THEN 2 ELSE 3 END,
+                          CASE WHEN m.status='sent' THEN m.sent_at END DESC, m.queued_at, m.id
+                 LIMIT 500"
+            ))?;
+            st.query_map([], |r| {
+                Ok(OutboxRow { message: message_row(r)?, business_name: r.get(15)?, display_name: r.get(16)?, scan_id: r.get(17)?, lead_status: r.get(18)? })
+            })?
+            .collect()
         })
         .await
     }

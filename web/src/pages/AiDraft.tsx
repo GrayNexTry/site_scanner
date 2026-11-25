@@ -3,7 +3,7 @@
 import { useEffect, useState, type CSSProperties } from "react";
 import { Link } from "react-router";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { api, type AiBatch, type AiKind, type Message } from "../api";
+import { aiInfo, api, type AiBatch, type AiKind, type Message } from "../api";
 import { fmtDate, fmtMs } from "../format";
 
 /** «$0.0011», «бесплатно» (0), «—» (нет данных). */
@@ -153,7 +153,7 @@ export function AiDraftPanel({
 }
 
 function DraftItem({ m, active, onUse, onDelete }: { m: Message; active: boolean; onUse: () => void; onDelete: () => void }) {
-  const ai = m.ai;
+  const ai = aiInfo(m);
   const lint = ai?.lint ?? [];
   const edited = !!ai && (ai.original.body !== m.body || (ai.original.subject || "") !== (m.subject || ""));
   return (
@@ -161,13 +161,18 @@ function DraftItem({ m, active, onUse, onDelete }: { m: Message; active: boolean
       <summary className="small" style={{ cursor: "pointer" }}>
         <span>{fmtDate(m.created_at)}</span>
         {" · "}
-        <span className={m.status === "sent" ? "st-pass" : undefined}>{m.status === "sent" ? `отправлено ${fmtDate(m.sent_at)}` : "черновик"}</span>
-        {ai && <span className="faint"> · {shortModel(ai.model || ai.model_requested)} · {fmtMs(ai.ms)} · {fmtCost(ai.cost)}</span>}
+        <MessageStatus m={m} />
+        {ai ? (
+          <span className="faint"> · {shortModel(ai.model || ai.model_requested)} · {fmtMs(ai.ms)} · {fmtCost(ai.cost)}</span>
+        ) : (
+          <span className="faint"> · {m.ai && "source" in m.ai && m.ai.source === "template" ? "шаблон сканера" : "свой текст"}</span>
+        )}
         {lint.length > 0 && <span className="st-warn"> · замечаний: {lint.length}</span>}
         {edited && <span className="faint"> · правлен</span>}
         {active && <span className="faint"> · в поле</span>}
       </summary>
       <div className="stack" style={{ gap: 8, marginTop: 8 }}>
+        {m.error && <div className="small st-fail">{m.error}</div>}
         {m.subject && <div className="small"><b>Тема:</b> {m.subject}</div>}
         <div className="small" style={{ whiteSpace: "pre-wrap" }}>{m.body}</div>
         {lint.length > 0 && (
@@ -205,6 +210,22 @@ function DraftItem({ m, active, onUse, onDelete }: { m: Message; active: boolean
   );
 }
 
+/** Статус письма словами: черновик, в рассылке, отправлено, не ушло. */
+export function MessageStatus({ m }: { m: Message }) {
+  switch (m.status) {
+    case "sent":
+      return <span className="st-pass">отправлено {fmtDate(m.sent_at)}{m.to_addr ? ` на ${m.to_addr}` : ""}</span>;
+    case "queued":
+      return <span className="st-warn">в рассылке{m.to_addr ? ` → ${m.to_addr}` : ""}</span>;
+    case "sending":
+      return <span className="st-warn">отправляется…</span>;
+    case "failed":
+      return <span className="st-fail">не ушло</span>;
+    default:
+      return <span>черновик</span>;
+  }
+}
+
 /* ------------------------------------------------------------------ массово на странице скана */
 
 const KIND_LABEL: Record<AiKind, string> = { email: "Письма", short: "Сообщения для мессенджера" };
@@ -216,6 +237,7 @@ export function AiBatchBar({ items }: { items: { id: number; hasContacts: boolea
   const [kind, setKind] = useState<AiKind>("email");
   const [profileId, setProfileId] = useState("");
   const [skip, setSkip] = useState(true);
+  const [enqueue, setEnqueue] = useState(false);
   // Без контактов писать некуда, а бесплатный лимит (50 запросов в день) тратится — по умолчанию их не берём; галочку видно.
   const [withContacts, setWithContacts] = useState(true);
   const reachable = items.filter((x) => x.hasContacts).length;
@@ -227,7 +249,7 @@ export function AiBatchBar({ items }: { items: { id: number; hasContacts: boolea
   });
   const b: AiBatch | undefined = status.data;
   const start = useMutation({
-    mutationFn: () => api.startAiBatch({ ids, kind, profile_id: profileId || current || undefined, skip_existing: skip }),
+    mutationFn: () => api.startAiBatch({ ids, kind, profile_id: profileId || current || undefined, skip_existing: skip, enqueue: kind === "email" && enqueue }),
     onSuccess: (d) => qc.setQueryData(["ai-batch"], d),
   });
   const stop = useMutation({ mutationFn: api.cancelAiBatch, onSuccess: (d) => qc.setQueryData(["ai-batch"], d) });
@@ -270,14 +292,20 @@ export function AiBatchBar({ items }: { items: { id: number; hasContacts: boolea
               <input type="checkbox" checked={withContacts} onChange={(e) => setWithContacts(e.target.checked)} />
               только с контактами ({reachable} из {items.length})
             </label>
+            {kind === "email" && (
+              <label className="small" style={{ display: "flex", gap: 6, alignItems: "center" }}>
+                <input type="checkbox" checked={enqueue} onChange={(e) => setEnqueue(e.target.checked)} />
+                сразу в очередь рассылки
+              </label>
+            )}
             <span className="spacer" />
             <button type="button" className="btn btn-primary" onClick={() => start.mutate()} disabled={start.isPending || ids.length === 0 || (loaded && !keySet)}>
               Составить для {ids.length}
             </button>
           </div>
           <span className="small faint">
-            Берутся компании из списка ниже с учётом фильтров. Компании без проверки, закрытые для сканера, и точки сетей пропускаются. Черновики появятся на страницах компаний; отправка
-            пока вручную.
+            Компании без проверки, закрытые для сканера, и точки сетей пропускаются. Черновики появятся на страницах компаний. «Сразу в очередь» ставит письма в рассылку, но
+            отправка начнётся только после «Запустить рассылку» — перед этим их можно перечитать на странице <Link to="/mail">«Рассылка»</Link>.
           </span>
           <ErrorLine error={start.error} />
         </>
@@ -289,7 +317,8 @@ export function AiBatchBar({ items }: { items: { id: number; hasContacts: boolea
             <span>
               {KIND_LABEL[b.kind as AiKind] ?? b.kind}: составлено {b.done} из {b.total}
               {b.skipped ? `, пропущено ${b.skipped}` : ""}
-              {b.failed ? `, ошибок ${b.failed}` : ""} · {fmtCost(b.cost)} · {b.profile} ({shortModel(b.model)})
+              {b.failed ? `, ошибок ${b.failed}` : ""}
+              {b.queued ? `, в рассылку ${b.queued}` : ""} · {fmtCost(b.cost)} · {b.profile} ({shortModel(b.model)})
             </span>
             <span className="spacer" />
             {running && <button type="button" className="btn btn-sm" onClick={() => stop.mutate()} disabled={stop.isPending}>Остановить</button>}

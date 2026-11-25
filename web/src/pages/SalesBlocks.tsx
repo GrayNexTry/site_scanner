@@ -18,6 +18,7 @@ import {
 } from "../api";
 import { ConfirmButton, useToast } from "../components";
 import { AiDraftPanel } from "./AiDraft";
+import { QueueEmail } from "./Mail";
 import {
   ACTIVITY_LABEL,
   CHANNEL_LABEL,
@@ -386,7 +387,6 @@ export function OutreachCard({ b, outreach, contacts, messages }: { b: Business;
     },
   });
   const copy = (text: string, what: string) => copyText(text).then((ok) => show(ok ? `${what} скопировано` : "Не удалось скопировать"));
-  const emailTo = contacts.find((c) => c.kind === "email");
 
   if (!outreach) {
     return (
@@ -420,7 +420,14 @@ export function OutreachCard({ b, outreach, contacts, messages }: { b: Business;
         <>
           <input className="input" value={subject} onChange={(e) => setSubject(e.target.value)} aria-label="Тема письма" />
           <textarea className="input" rows={10} value={body} onChange={(e) => setBody(e.target.value)} aria-label="Текст письма" />
-          {emailTo && <span className="small muted">Адрес: {emailTo.value}</span>}
+          <QueueEmail
+            businessId={b.id}
+            contacts={contacts}
+            draftId={draft.email}
+            subject={subject}
+            body={body}
+            onQueued={(mid) => setDraft((d) => ({ ...d, email: mid }))}
+          />
         </>
       )}
 

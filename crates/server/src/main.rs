@@ -10,6 +10,7 @@ mod assets;
 mod cli_audit;
 mod db;
 mod jobs;
+mod mail;
 mod settings;
 
 use std::net::SocketAddr;
@@ -87,6 +88,8 @@ async fn main() -> anyhow::Result<()> {
         info!("прерванных сканов: {interrupted} — их можно доделать кнопкой «Продолжить»");
     }
     let state = jobs::AppState::new(db).await?;
+    // Рассылка по почте: фоновая задача, спит, пока её не запустят и пока в очереди нет писем.
+    mail::spawn_worker(state.clone());
     // Старые проверки без мини-отчёта — пересчитать из сохранённых результатов (без сети).
     {
         let st = state.clone();

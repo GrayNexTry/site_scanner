@@ -50,6 +50,10 @@ pub struct Settings {
     pub company_name: String,
     /// Своя первая фраза; пусто — по категории («Я делаю сайты и SEO для клиник»).
     pub intro: String,
+    /// Ссылка на примеры работ: в подписи письма и для нейросети.
+    pub portfolio_url: String,
+    /// Пара фраз о себе для нейросети: опыт, с кем работаете, примеры.
+    pub about_me: String,
     /// Валюта цен по умолчанию: BYN, RUB, USD, EUR, GBP, PLN…
     pub currency: String,
     /// Прайс на пакеты работ (КП): `{id, title, price, enabled}`.
@@ -65,6 +69,36 @@ pub struct Settings {
     pub ai_profile: String,
     /// Сколько писем составлять одновременно при массовой генерации (у бесплатных моделей — 20 запросов в минуту).
     pub ai_concurrency: usize,
+    /// Почта для рассылки (SMTP).
+    pub smtp_host: String,
+    pub smtp_port: u16,
+    /// `ssl` — сразу TLS (порт 465), `starttls` — порт 587.
+    pub smtp_security: String,
+    pub smtp_user: String,
+    /// Пароль приложения (секрет).
+    pub smtp_password: String,
+    pub mail_from_name: String,
+    /// Адрес отправителя; пусто — логин SMTP.
+    pub mail_from_email: String,
+    /// Куда отвечать, если не на адрес отправителя.
+    pub mail_reply_to: String,
+    /// Пауза между письмами: случайная, от и до (секунды).
+    pub mail_interval_min: u64,
+    pub mail_interval_max: u64,
+    /// Писем в день, не больше (новому ящику — 20–30, иначе письма уходят в спам).
+    pub mail_daily_limit: u32,
+    /// Окно отправки по вашему времени: с какого часа и до какого.
+    pub mail_window_start: u32,
+    pub mail_window_end: u32,
+    /// Только по будням.
+    pub mail_weekdays_only: bool,
+    /// Прикладывать PDF-разбор сайта (кроме компаний без сайта).
+    pub mail_attach_report: bool,
+    /// Строка в конце письма — как отказаться от писем (по-русски и по-английски).
+    pub mail_footer: String,
+    pub mail_footer_en: String,
+    /// Рассылка запущена (переживает перезапуск сервера).
+    pub mail_running: bool,
 }
 
 impl Default for Settings {
@@ -97,6 +131,8 @@ impl Default for Settings {
             manager_telegram: String::new(),
             company_name: String::new(),
             intro: String::new(),
+            portfolio_url: String::new(),
+            about_me: String::new(),
             currency: "BYN".into(),
             price_list: scanner_core::sales::default_price_list(),
             price_lists: Default::default(),
@@ -104,14 +140,34 @@ impl Default for Settings {
             ai_profiles: vec![scanner_core::llm::AiProfile::default()],
             ai_profile: "default".into(),
             ai_concurrency: 2,
+            smtp_host: String::new(),
+            smtp_port: 465,
+            smtp_security: "ssl".into(),
+            smtp_user: String::new(),
+            smtp_password: String::new(),
+            mail_from_name: String::new(),
+            mail_from_email: String::new(),
+            mail_reply_to: String::new(),
+            mail_interval_min: 120,
+            mail_interval_max: 300,
+            mail_daily_limit: 25,
+            mail_window_start: 9,
+            mail_window_end: 19,
+            mail_weekdays_only: true,
+            mail_attach_report: true,
+            mail_footer: "Если это неактуально, просто ответьте «нет» — больше писать не буду.".into(),
+            mail_footer_en: "If this isn't relevant, just reply \"no\" and I won't write again.".into(),
+            mail_running: false,
         }
     }
 }
 
-const KEY_FIELDS: &[&str] = &["google_places_key", "yandex_geosearch_key", "psi_key", "safe_browsing_key", "brave_search_key", "yandex_search_key", "proxy_url", "openrouter_key"];
+const KEY_FIELDS: &[&str] = &["google_places_key", "yandex_geosearch_key", "psi_key", "safe_browsing_key", "brave_search_key", "yandex_search_key", "proxy_url", "openrouter_key", "smtp_password"];
 
+/// Маска секрета: последние 4 символа — только у длинных значений (ключи API); короткий пароль не показываем совсем.
 fn mask(k: &str) -> Value {
-    let tail: String = k.chars().rev().take(4).collect::<Vec<_>>().into_iter().rev().collect();
+    let n = k.chars().count();
+    let tail: String = if n >= 12 { k.chars().skip(n - 4).collect() } else { String::new() };
     json!({ "set": !k.is_empty(), "hint": if k.is_empty() { String::new() } else { format!("••••{tail}") } })
 }
 
@@ -125,6 +181,8 @@ impl Settings {
             telegram: self.manager_telegram.clone(),
             company: self.company_name.clone(),
             intro: self.intro.clone(),
+            portfolio: self.portfolio_url.clone(),
+            about: self.about_me.clone(),
         }
     }
 
@@ -157,6 +215,17 @@ impl Settings {
             .or(self.ai_profiles.first())
             .cloned()
             .unwrap_or_default()
+    }
+
+    /// Почта для рассылки заполнена: сервер, логин, пароль и адрес отправителя.
+    pub fn mail_configured(&self) -> bool {
+        !self.smtp_host.trim().is_empty() && !self.smtp_user.trim().is_empty() && !self.smtp_password.is_empty() && self.mail_from().contains('@')
+    }
+
+    /// Адрес отправителя: заданный или логин SMTP.
+    pub fn mail_from(&self) -> String {
+        let f = self.mail_from_email.trim();
+        if f.is_empty() { self.smtp_user.trim().to_string() } else { f.to_string() }
     }
 
     pub fn search_config(&self) -> scanner_core::search::SearchConfig {
@@ -202,6 +271,21 @@ impl Settings {
         key("company_name", &mut self.company_name);
         key("intro", &mut self.intro);
         key("openrouter_key", &mut self.openrouter_key);
+        key("portfolio_url", &mut self.portfolio_url);
+        key("about_me", &mut self.about_me);
+        key("smtp_host", &mut self.smtp_host);
+        key("smtp_user", &mut self.smtp_user);
+        key("smtp_password", &mut self.smtp_password);
+        key("mail_from_name", &mut self.mail_from_name);
+        key("mail_from_email", &mut self.mail_from_email);
+        key("mail_reply_to", &mut self.mail_reply_to);
+        key("mail_footer", &mut self.mail_footer);
+        key("mail_footer_en", &mut self.mail_footer_en);
+        // «plain» (без шифрования) — только для почтового сервера на этом компьютере.
+        let local = matches!(self.smtp_host.trim(), "localhost" | "127.0.0.1" | "::1");
+        if let Some(sec) = patch.get("smtp_security").and_then(Value::as_str).filter(|v| ["ssl", "starttls"].contains(v) || (*v == "plain" && local)) {
+            self.smtp_security = sec.to_string();
+        }
         if let Some(list) = patch.get("ai_profiles").and_then(|v| serde_json::from_value::<Vec<scanner_core::llm::AiProfile>>(v.clone()).ok()) {
             self.ai_profiles = scanner_core::llm::normalize_profiles(&list);
         }
@@ -247,6 +331,25 @@ impl Settings {
         if let Some(x) = num("ai_concurrency", 1, 8) {
             self.ai_concurrency = x as usize;
         }
+        if let Some(x) = num("smtp_port", 1, 65535) {
+            self.smtp_port = x as u16;
+        }
+        if let Some(x) = num("mail_interval_min", 10, 86_400) {
+            self.mail_interval_min = x;
+        }
+        if let Some(x) = num("mail_interval_max", 10, 86_400) {
+            self.mail_interval_max = x;
+        }
+        self.mail_interval_max = self.mail_interval_max.max(self.mail_interval_min);
+        if let Some(x) = num("mail_daily_limit", 1, 2000) {
+            self.mail_daily_limit = x as u32;
+        }
+        if let Some(x) = num("mail_window_start", 0, 23) {
+            self.mail_window_start = x as u32;
+        }
+        if let Some(x) = num("mail_window_end", 1, 24) {
+            self.mail_window_end = x as u32;
+        }
         let flag = |name: &str, target: &mut bool| {
             if let Some(b) = patch.get(name).and_then(Value::as_bool) {
                 *target = b;
@@ -258,6 +361,8 @@ impl Settings {
         flag("search_free", &mut self.search_free);
         flag("render_js", &mut self.render_js);
         flag("proxy_always", &mut self.proxy_always);
+        flag("mail_weekdays_only", &mut self.mail_weekdays_only);
+        flag("mail_attach_report", &mut self.mail_attach_report);
     }
 }
 
@@ -280,7 +385,7 @@ mod tests {
         s.apply(&json!({"google_places_key": ""}));
         assert!(s.google_places_key.is_empty());
         s.apply(&json!({"proxy_url": "socks5h://user:pass@10.0.0.2:1080"}));
-        assert!(!s.public().to_string().contains("pass"), "пароль прокси наружу не отдаём");
+        assert!(!s.public().to_string().contains("user:pass@"), "пароль прокси наружу не отдаём");
         assert!(s.fetch_config().proxy.is_some());
         // Профиль менеджера и прайс: прайс дополняется умолчаниями, валюта — трёхбуквенный код.
         assert_eq!((s.manager_email.as_str(), s.currency.as_str(), s.price_list.len()), ("", "BYN", 15));
@@ -301,6 +406,15 @@ mod tests {
         assert_eq!(s.ai_profile(Some("fast-2")).name, "Копия");
         assert_eq!(s.ai_profile(Some("нет такого")).id, "fast");
         assert_eq!(s.ai_profiles[0].system, scanner_core::llm::DEFAULT_SYSTEM, "поля, которых нет в патче, — по умолчанию");
+        // Почта: пароль — секрет, интервалы и окно ограничены, адрес отправителя по умолчанию — логин.
+        s.apply(&json!({"smtp_host": "smtp.gmail.com", "smtp_user": "me@example.com", "smtp_password": "app-pass-SECRET", "smtp_security": "tls?", "mail_interval_min": 5, "mail_interval_max": 1, "mail_window_end": 30}));
+        assert!(!s.public().to_string().contains("SECRET"));
+        s.apply(&json!({"smtp_password": "pw12"}));
+        assert_eq!(s.public()["smtp_password"]["hint"], "••••", "короткий пароль не показываем даже частично");
+        s.apply(&json!({"smtp_password": "app-pass-SECRET"}));
+        assert!(s.mail_configured() && s.mail_from() == "me@example.com");
+        assert_eq!((s.smtp_security.as_str(), s.mail_interval_min, s.mail_interval_max, s.mail_window_end), ("ssl", 10, 10, 24));
+        assert!(!s.mail_running, "рассылка включается только кнопкой");
         s.apply(&json!({"ai_profiles": []}));
         assert_eq!((s.ai_profiles.len(), s.ai_profile.as_str()), (1, "default"), "пустой список → профиль по умолчанию");
     }

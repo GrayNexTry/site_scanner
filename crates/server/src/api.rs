@@ -77,7 +77,8 @@ pub fn router(state: Shared) -> Router {
         .route("/geocode", get(geocode))
         .route("/reverse", get(reverse))
         .route("/net", get(net))
-        .merge(crate::ai::routes());
+        .merge(crate::ai::routes())
+        .merge(crate::mail::routes());
     Router::new()
         .nest("/api", api)
         .fallback(crate::assets::serve)
@@ -139,18 +140,26 @@ fn attachment(name: &str, ascii_fallback: &str) -> String {
 }
 
 /// Страница `/{page}/{id}` приложения в PDF — печатает headless-браузер, без колонтитулов браузера.
-async fn page_pdf(st: &Shared, id: i64, page: &str, title: &str, ascii_prefix: &str) -> ApiResult<Response> {
-    let b = st.db.get_business(id).await?.ok_or_else(not_found)?;
+/// PDF страницы сканера (`report`, `proposal`) через headless Chromium. Ошибка — понятным текстом.
+pub(crate) async fn render_pdf(st: &Shared, id: i64, page: &str) -> Result<Vec<u8>, String> {
     let browser = {
         let s = st.settings.read().await;
         scanner_core::render::find_browser(Some(s.browser_path.as_str()).filter(|p| !p.trim().is_empty()))
     }
-    .ok_or_else(|| bad("Нет браузера для PDF: поставьте Chromium (pacman -S chromium) или укажите путь в настройках. Пока можно «Печать» → «Сохранить как PDF»"))?;
+    .ok_or_else(|| "Нет браузера для PDF: поставьте Chromium (pacman -S chromium) или укажите путь в настройках".to_string())?;
     let base = SELF_URL.get().cloned().unwrap_or_else(|| "http://127.0.0.1:8787".into());
-    let pdf = scanner_core::render::print_pdf(&browser, &format!("{base}/{page}/{id}"), Duration::from_secs(60))
-        .await
-        .map_err(|e| ApiError(StatusCode::BAD_GATEWAY, format!("PDF не собрался: {e}")))?;
-    let host = b.site.get("final_url").and_then(|v| v.as_str()).or(b.website.as_deref()).and_then(parse_url_lenient).map(|u| host_of(&u)).filter(|h| !h.is_empty());
+    scanner_core::render::print_pdf(&browser, &format!("{base}/{page}/{id}"), Duration::from_secs(60)).await.map_err(|e| format!("PDF не собрался: {e}"))
+}
+
+/// Домен сайта компании для имени файла.
+pub(crate) fn file_host(b: &crate::db::BusinessRow) -> Option<String> {
+    b.site.get("final_url").and_then(|v| v.as_str()).or(b.website.as_deref()).and_then(parse_url_lenient).map(|u| host_of(&u)).filter(|h| !h.is_empty())
+}
+
+async fn page_pdf(st: &Shared, id: i64, page: &str, title: &str, ascii_prefix: &str) -> ApiResult<Response> {
+    let b = st.db.get_business(id).await?.ok_or_else(not_found)?;
+    let pdf = render_pdf(st, id, page).await.map_err(|e| if e.starts_with("Нет браузера") { bad(format!("{e}. Пока можно «Печать» → «Сохранить как PDF»")) } else { ApiError(StatusCode::BAD_GATEWAY, e) })?;
+    let host = file_host(&b);
     let name = format!("{title} {}.pdf", host.clone().unwrap_or_else(|| b.name.clone())).replace(['/', '\\', '"'], " ");
     let ascii = format!("{ascii_prefix}-{}.pdf", host.filter(|h| h.is_ascii()).unwrap_or_else(|| id.to_string()));
     Ok(([(header::CONTENT_TYPE, "application/pdf".to_string()), (header::CONTENT_DISPOSITION, attachment(&name, &ascii))], pdf).into_response())
@@ -480,16 +489,21 @@ impl LeadCtx {
     }
 }
 
+/// Контакты компании: карточки, сайт (если сайт её и настоящий), добавленные вручную.
+pub(crate) fn lead_contacts(b: &crate::db::BusinessRow, ctx: &LeadCtx) -> Vec<sales::Contact> {
+    // Заглушка, мёртвый, чужой или неподтверждённый сайт: его контакты и соцсети принадлежат хостеру или другой компании.
+    let site: Contacts = if sales::site_contacts_trusted(ctx.state, &ctx.results) { serde_json::from_value(b.site["contacts"].clone()).unwrap_or_default() } else { Contacts::default() };
+    let manual: Vec<ManualContact> = serde_json::from_value(b.extra_contacts.clone()).unwrap_or_default();
+    sales::contact_list(&ctx.card, &site, &manual, ctx.country())
+}
+
 /// Всё, что менеджеру нужно к карточке лида: контакты, собранное КП, первое сообщение и язык материалов (`lang`).
 async fn sales_view(st: &Shared, b: &crate::db::BusinessRow, scan: Option<&crate::db::ScanRow>) -> (Value, Value, Value, &'static str) {
     let s = st.settings.read().await.clone();
     let ctx = LeadCtx::new(b, scan, &s);
     let country = ctx.country();
     let lang = sales::outreach_lang(country, &ctx.cities);
-    // Заглушка, мёртвый, чужой или неподтверждённый сайт: его контакты и соцсети принадлежат хостеру или другой компании.
-    let site: Contacts = if sales::site_contacts_trusted(ctx.state, &ctx.results) { serde_json::from_value(b.site["contacts"].clone()).unwrap_or_default() } else { Contacts::default() };
-    let manual: Vec<ManualContact> = serde_json::from_value(b.extra_contacts.clone()).unwrap_or_default();
-    let contacts = sales::contact_list(&ctx.card, &site, &manual, country);
+    let contacts = lead_contacts(b, &ctx);
     // Валюта КП: у лида заданная, иначе по стране скана. Цены — из прайса этой валюты (курсом не пересчитываются).
     let currency = b.deal_currency.clone().filter(|c| !c.is_empty()).unwrap_or_else(|| sales::currency_for_country(country, &s.currency));
     let (prices, mismatch) = sales::price_list_for(&currency, &s.currency, &s.price_list, &s.price_lists);
@@ -775,6 +789,14 @@ async fn mark_sent(State(st): State<Shared>, Path(id): Path<i64>, Json(s): Json<
         let subject = s.subject.map(|x| x.trim().to_string()).filter(|_| m.kind == "email");
         st.db.update_message(mid, subject, s.body.map(|x| x.trim().to_string()).filter(|x| !x.is_empty()), Some("sent")).await?;
     }
+    let activity = record_sent(&st, &before, channel, text).await?;
+    Ok(Json(json!({ "activity": activity, "business": st.db.business_brief(id).await?, "activities": st.db.list_activities(id).await? })))
+}
+
+/// Сообщение отправлено (вручную или рассылкой): касание в журнал, «Новый» → «Написали»,
+/// следующий шаг «Проверить ответ» через 3 дня, если шага ещё нет.
+pub(crate) async fn record_sent(st: &Shared, before: &crate::db::BusinessRow, channel: String, text: Option<String>) -> anyhow::Result<crate::db::Activity> {
+    let id = before.id;
     let activity = st.db.add_activity(id, "message".into(), Some(channel), text, None).await?;
     let mut meta = crate::db::MetaPatch::default();
     let empty = |v: &Option<String>| v.as_deref().is_none_or(|x| x.trim().is_empty());
@@ -791,7 +813,7 @@ async fn mark_sent(State(st): State<Shared>, Path(id): Path<i64>, Json(s): Json<
     }
     st.db.update_business_meta(id, meta).await?;
     st.emit_business(id).await;
-    Ok(Json(json!({ "activity": activity, "business": st.db.business_brief(id).await?, "activities": st.db.list_activities(id).await? })))
+    Ok(activity)
 }
 
 async fn list_leads(State(st): State<Shared>) -> ApiResult<Json<Value>> {
@@ -1079,7 +1101,7 @@ mod tests {
         assert_eq!(st, StatusCode::OK);
         assert_eq!(v["catalog"]["metrics"].as_array().unwrap().len(), 214);
         assert_eq!(v["providers"][0]["id"], "osm");
-        let (st, v) = call(app.clone(), "PUT", "/api/settings", Some(json!({"psi_key": "KEY12345"}))).await;
+        let (st, v) = call(app.clone(), "PUT", "/api/settings", Some(json!({"psi_key": "AIzaKEY0012345"}))).await;
         assert_eq!(st, StatusCode::OK);
         assert_eq!(v["psi_key"]["hint"], "••••2345");
         let (_, v) = call(app, "GET", "/api/meta", None).await;

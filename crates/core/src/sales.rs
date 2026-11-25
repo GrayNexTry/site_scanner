@@ -1068,6 +1068,10 @@ pub struct Manager {
     pub company: String,
     /// Своя первая фраза; пусто — по категории.
     pub intro: String,
+    /// Ссылка на примеры работ — в подписи и для нейросети.
+    pub portfolio: String,
+    /// Пара фраз о себе для нейросети: опыт, с кем работаете, примеры.
+    pub about: String,
 }
 
 /// Домен клиента для сообщения и КП: из карточки (magicart.by), затем адрес найденного сайта,
@@ -1571,6 +1575,9 @@ fn signature(m: &Manager, lang: Lang) -> String {
     if !m.telegram.trim().is_empty() {
         lines.push(format!("Telegram {}", at_handle(&m.telegram)));
     }
+    if !m.portfolio.trim().is_empty() {
+        lines.push(format!("{} {}", if lang == Lang::Ru { "Примеры работ:" } else { "Portfolio:" }, m.portfolio.trim()));
+    }
     if lines.is_empty() {
         return String::new();
     }
@@ -2030,7 +2037,7 @@ mod tests {
     #[test]
     fn outreach_signature_and_custom_intro() {
         let cities: Vec<String> = vec![];
-        let m = Manager { name: "Никита".into(), email: "hello@example.com".into(), phone: "+375 29 000-00-00".into(), telegram: "nextry".into(), company: "NexTry".into(), intro: "Меня зовут Никита, делаю сайты для малого бизнеса.".into() };
+        let m = Manager { name: "Никита".into(), email: "hello@example.com".into(), phone: "+375 29 000-00-00".into(), telegram: "nextry".into(), company: "NexTry".into(), intro: "Меня зовут Никита, делаю сайты для малого бизнеса.".into(), ..Default::default() };
         let out = outreach(&OutreachInput {
             business: "Кафе Уют",
             category: Some("Кафе"),
