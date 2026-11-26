@@ -14,6 +14,7 @@ pub mod model;
 pub mod page;
 pub mod providers;
 pub mod psi;
+pub mod public_sector;
 pub mod region;
 pub mod render;
 pub mod robots;

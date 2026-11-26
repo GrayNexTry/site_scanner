@@ -110,6 +110,9 @@ pub struct Place {
     pub brand: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub wikidata: Option<String>,
+    /// Кто владелец (OSM `operator:type`): government, public, municipal… — госорганизациям рассылка не пишет.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub operator_type: Option<String>,
 }
 
 /// Компания после объединения карточек разных провайдеров.
@@ -169,6 +172,10 @@ impl Business {
     }
     pub fn wikidata(&self) -> Option<&str> {
         self.sources.iter().find_map(|p| p.wikidata.as_deref())
+    }
+    /// OSM `operator:type` из карточек (government, public…).
+    pub fn operator_types(&self) -> Vec<&str> {
+        self.sources.iter().filter_map(|p| p.operator_type.as_deref()).collect()
     }
 }
 

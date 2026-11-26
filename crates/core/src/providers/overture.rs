@@ -427,6 +427,7 @@ fn to_place(v: &Value, p: &ScanParams) -> Option<Place> {
         links: socials,
         brand: v["brand"]["names"]["primary"].as_str().map(str::to_string),
         wikidata: v["brand"]["wikidata"].as_str().map(str::to_string),
+        operator_type: None,
     })
 }
 

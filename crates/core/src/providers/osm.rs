@@ -158,6 +158,7 @@ pub fn parse(v: &Value, p: &ScanParams) -> Vec<Place> {
                 links,
                 brand: tag(tags, &["brand"]).map(str::to_string),
                 wikidata: tag(tags, &["brand:wikidata", "operator:wikidata"]).map(str::to_string),
+                operator_type: tag(tags, &["operator:type"]).map(str::to_string),
             })
         })
         .filter(|pl| haversine_m(p.center.lat, p.center.lon, pl.lat, pl.lon) <= p.radius_m * 1.05)

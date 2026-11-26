@@ -1,9 +1,9 @@
 // Рассылка по почте: настройки SMTP и правил, страница «Рассылка» (очередь, ошибки, отправленное, пуск/пауза),
 // постановка в очередь выбранных компаний и одного письма со страницы компании.
-import { useEffect, useState, type ReactNode } from "react";
+import { useEffect, useRef, useState, type ReactNode } from "react";
 import { Link } from "react-router";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { api, type Contact, type MailSource, type OutboxRow, type Settings } from "../api";
+import { api, type Contact, type MailSource, type OAuthProviderId, type OutboxRow, type Settings } from "../api";
 import { useToast } from "../components";
 import { LEAD_STATUS_LABEL } from "../format";
 import { MessageStatus } from "./AiDraft";
@@ -17,11 +17,155 @@ function ErrorLine({ error }: { error: Error | null }) {
 const PRESETS: { label: string; host: string; port: number; security: Settings["smtp_security"]; how: string }[] = [
   { label: "Gmail", host: "smtp.gmail.com", port: 465, security: "ssl", how: "Нужен пароль приложения: myaccount.google.com → Безопасность → двухэтапная аутентификация → Пароли приложений." },
   { label: "Яндекс", host: "smtp.yandex.ru", port: 465, security: "ssl", how: "Пароль приложения: id.yandex.ru → Безопасность → Пароли приложений → Почта; в настройках почты включите доступ по SMTP." },
-  { label: "Mail.ru", host: "smtp.mail.ru", port: 465, security: "ssl", how: "Пароль для внешнего приложения: Настройки → Безопасность → Пароли для внешних приложений." },
+  { label: "Mail.ru", host: "smtp.mail.ru", port: 465, security: "ssl", how: "Пароль для внешнего приложения: Настройки → Безопасность → Пароли для внешних приложений. Вход через аккаунт Mail.ru сторонним программам не даёт." },
 ];
 
 type MailTextKey = "smtp_host" | "smtp_user" | "mail_from_name" | "mail_from_email" | "mail_reply_to";
 type MailNumKey = "smtp_port" | "mail_interval_min" | "mail_interval_max" | "mail_daily_limit" | "mail_window_start" | "mail_window_end";
+
+/** Как зарегистрировать своё приложение OAuth у каждого сервиса (один раз, бесплатно). */
+function OAuthSteps({ provider, redirect }: { provider: OAuthProviderId; redirect: string | null }) {
+  const uri = redirect ? <code style={{ userSelect: "all" }}>{redirect}</code> : <span className="st-warn">откройте сканер по адресу 127.0.0.1</span>;
+  if (provider === "google")
+    return (
+      <ol className="small muted" style={{ margin: 0, paddingLeft: 18 }}>
+        <li>console.cloud.google.com → создайте проект (любое имя) → Library → включите «Gmail API».</li>
+        <li>Google Auth Platform → Get started: название, ваш адрес, аудитория — External.</li>
+        <li>Data Access → Add or remove scopes → вручную добавьте <code>https://mail.google.com/</code>.</li>
+        <li>
+          Audience → <b>Publish app</b> (In production). В режиме «Testing» Google отключает вход через 7 дней. При входе Google покажет «приложение не проверено» — для своего
+          ящика это нормально: «Дополнительно» → «Перейти».
+        </li>
+        <li>Clients → Create client → тип <b>Desktop app</b> → скопируйте сюда Client ID и Client secret. Адрес возврата для Desktop app указывать не нужно.</li>
+      </ol>
+    );
+  if (provider === "yandex")
+    return (
+      <ol className="small muted" style={{ margin: 0, paddingLeft: 18 }}>
+        <li>oauth.yandex.ru → «Создать приложение» (под тем ящиком, с которого пойдут письма).</li>
+        <li>Платформа — «Веб-сервисы», Redirect URI: {uri}</li>
+        <li>Доступы: «Почта» → отправка писем по SMTP (<code>mail:smtp</code>); «Яндекс ID» → доступ к адресу почты (<code>login:email</code>).</li>
+        <li>Скопируйте сюда ClientID и Client secret.</li>
+        <li>В Яндекс Почте: Все настройки → Почтовые программы → разрешите доступ к ящику с помощью почтовых клиентов.</li>
+      </ol>
+    );
+  return (
+    <ol className="small muted" style={{ margin: 0, paddingLeft: 18 }}>
+      <li>entra.microsoft.com → App registrations → New registration (нужна бесплатная учётная запись Microsoft Entra / Azure).</li>
+      <li>Supported account types — «Accounts in any organizational directory and personal Microsoft accounts».</li>
+      <li>Redirect URI: платформа «Public client/native (mobile &amp; desktop)» → {uri}</li>
+      <li>Скопируйте сюда Application (client) ID. Секрет не нужен, разрешения Microsoft спросит при входе.</li>
+    </ol>
+  );
+}
+
+/** Вход в почту через аккаунт: своё приложение OAuth, кнопка входа, состояние подключения. */
+function OAuthLogin() {
+  const qc = useQueryClient();
+  const [waiting, setWaiting] = useState(false);
+  const status = useQuery({ queryKey: ["oauth"], queryFn: api.oauthStatus, refetchInterval: waiting ? 2000 : false });
+  const st = status.data;
+  const [provider, setProvider] = useState<OAuthProviderId | null>(null);
+  const current: OAuthProviderId = provider ?? (st?.provider || "google");
+  const info = st?.providers.find((p) => p.id === current);
+  const [ids, setIds] = useState<Partial<Record<OAuthProviderId, string>>>({});
+  const [secret, setSecret] = useState("");
+  const [blockedUrl, setBlockedUrl] = useState<string | null>(null);
+  const tab = useRef<Window | null>(null);
+  const clientId = ids[current] ?? info?.client_id ?? "";
+  const refresh = () => {
+    qc.invalidateQueries({ queryKey: ["oauth"] });
+    qc.invalidateQueries({ queryKey: ["settings"] });
+    qc.invalidateQueries({ queryKey: ["mail-status"] });
+  };
+  const start = useMutation({
+    mutationFn: () => api.oauthStart({ provider: current, client_id: clientId.trim() || undefined, client_secret: secret.trim() || undefined }),
+    onSuccess: (r) => {
+      setSecret("");
+      setBlockedUrl(null);
+      if (tab.current && !tab.current.closed) tab.current.location.href = r.url;
+      else setBlockedUrl(r.url);
+      setWaiting(true);
+      refresh();
+    },
+    onError: () => tab.current?.close(),
+  });
+  const logout = useMutation({ mutationFn: api.oauthDisconnect, onSuccess: refresh });
+  // Вход завершён (успешно или с ошибкой) — перестать опрашивать и обновить настройки; через 5 минут — сдаться.
+  const done = !!(st?.last_ok || st?.last_error);
+  useEffect(() => {
+    if (!waiting) return;
+    if (done) {
+      setWaiting(false);
+      refresh();
+      return;
+    }
+    const t = setTimeout(() => setWaiting(false), 5 * 60_000);
+    return () => clearTimeout(t);
+  }, [waiting, done]);
+  const login = () => {
+    // Вкладку открываем сразу по нажатию (иначе браузер заблокирует её), адрес входа подставим после ответа сервера.
+    tab.current = window.open("about:blank", "_blank");
+    start.mutate();
+  };
+  if (!st) return <span className="small muted">{status.error ? status.error.message : "Загружаю…"}</span>;
+  const connectedHere = st.connected && st.provider === current;
+  return (
+    <div className="stack" style={{ gap: 12 }}>
+      {st.connected && (
+        <div className="row" style={{ alignItems: "center" }}>
+          <span className="small st-pass">
+            Подключено: <b>{st.email}</b> ({st.providers.find((p) => p.id === st.provider)?.name})
+          </span>
+          <span className="spacer" />
+          <button type="button" className="btn btn-sm btn-ghost btn-danger" onClick={() => logout.mutate()} disabled={logout.isPending}>Выйти</button>
+        </div>
+      )}
+      <div className="row">
+        <span className="label">Сервис</span>
+        {st.providers.map((p) => (
+          <button key={p.id} type="button" className="chip" aria-pressed={current === p.id} onClick={() => setProvider(p.id)}>{p.name}</button>
+        ))}
+      </div>
+      <details open={!info?.client_id}>
+        <summary className="small">Как подключить {info?.name} — один раз, бесплатно</summary>
+        <div style={{ marginTop: 8 }}>
+          <OAuthSteps provider={current} redirect={st.redirect_uri} />
+          <p className="hint" style={{ marginTop: 8 }}>
+            Приложение — ваше: Google и другие сервисы не дают программам с открытым кодом общий ключ к чужой почте. Пароль ящика сканер не видит; доступ можно отозвать в
+            настройках аккаунта.
+          </p>
+        </div>
+      </details>
+      <div className={info?.needs_secret ? "grid-2" : ""}>
+        <div className="field">
+          <label htmlFor={`oauth-${current}-id`}>Client ID</label>
+          <input id={`oauth-${current}-id`} className="input" autoComplete="off" value={clientId} onChange={(e) => setIds((m) => ({ ...m, [current]: e.target.value }))} placeholder={current === "google" ? "….apps.googleusercontent.com" : ""} />
+        </div>
+        {info?.needs_secret && (
+          <div className="field">
+            <label htmlFor={`oauth-${current}-secret`}>Client secret</label>
+            <input id={`oauth-${current}-secret`} className="input" type="password" autoComplete="off" value={secret} onChange={(e) => setSecret(e.target.value)} placeholder={info.secret_set ? "задан — оставьте пустым" : "вставьте секрет"} />
+          </div>
+        )}
+      </div>
+      <div className="row" style={{ alignItems: "center" }}>
+        <button type="button" className="btn btn-primary" onClick={login} disabled={start.isPending || !clientId.trim() || !!st.redirect_error}>
+          {connectedHere ? "Войти другим ящиком" : `Войти через ${info?.name ?? ""}`}
+        </button>
+        {waiting && <span className="small muted">Завершите вход во вкладке сервиса…</span>}
+        {st.redirect_error && <span className="small st-warn">{st.redirect_error}</span>}
+        <ErrorLine error={start.error ?? logout.error} />
+      </div>
+      {blockedUrl && (
+        <span className="small">
+          Браузер не открыл вкладку — <a href={blockedUrl} target="_blank" rel="noreferrer">откройте страницу входа</a>.
+        </span>
+      )}
+      {st.last_error && !waiting && <div className="banner warn small"><span>{st.last_error}</span></div>}
+    </div>
+  );
+}
 
 export function MailSettingsCard({ limits, setLimits, passwordInput }: { limits: Partial<Settings>; setLimits: (f: (l: Partial<Settings>) => Partial<Settings>) => void; passwordInput: ReactNode }) {
   const test = useMutation({ mutationFn: () => api.mailTest() });
@@ -41,40 +185,52 @@ export function MailSettingsCard({ limits, setLimits, passwordInput }: { limits:
     </div>
   );
   const preset = PRESETS.find((p) => p.host === limits.smtp_host);
+  const oauth = limits.smtp_auth === "oauth";
   return (
     <div className="card" id="mail">
       <div className="card-head"><h2>Почта для рассылки</h2></div>
       <div className="card-pad stack" style={{ gap: 16 }}>
         <p className="small muted" style={{ margin: 0 }}>
-          Письма уходят с вашего ящика по одному, с паузами и дневным лимитом, только в окно отправки. Что и кому — решаете вы в скане и на странице «Рассылка»; рассылка
-          запускается кнопкой. После отправки компания становится «Написали», в журнале — текст письма, следующий шаг — «Проверить ответ» через 3 дня.
+          Письма уходят с вашего ящика по одному, с паузами и дневным лимитом, только по будням и днём по времени получателя. Что и кому — решаете вы в скане и на странице
+          «Рассылка»; рассылка запускается кнопкой. После отправки компания становится «Написали», в журнале — текст письма, следующий шаг — «Проверить ответ» через 3 дня.
         </p>
         <div className="row">
-          <span className="label">Почтовый сервис</span>
-          {PRESETS.map((p) => (
-            <button key={p.host} type="button" className="chip" aria-pressed={limits.smtp_host === p.host} onClick={() => set({ smtp_host: p.host, smtp_port: p.port, smtp_security: p.security })}>{p.label}</button>
-          ))}
+          <span className="label">Как входить</span>
+          <button type="button" className="chip" aria-pressed={oauth} onClick={() => set({ smtp_auth: "oauth" })}>Через аккаунт (Google, Яндекс, Microsoft)</button>
+          <button type="button" className="chip" aria-pressed={!oauth} onClick={() => set({ smtp_auth: "password" })}>Пароль приложения</button>
         </div>
-        {preset && <span className="hint">{preset.how}</span>}
-        <div className="grid-3">
-          {text("smtp_host", "SMTP-сервер", "smtp.example.com")}
-          {num("smtp_port", "Порт", "465 — SSL, 587 — STARTTLS.", 1, 65535)}
-          <div className="field">
-            <label htmlFor="smtp_security">Шифрование</label>
-            <select id="smtp_security" className="select" style={{ height: 34 }} value={limits.smtp_security ?? "ssl"} onChange={(e) => set({ smtp_security: e.target.value as Settings["smtp_security"] })}>
-              <option value="ssl">SSL/TLS (обычно порт 465)</option>
-              <option value="starttls">STARTTLS (обычно порт 587)</option>
-              {limits.smtp_security === "plain" && <option value="plain">без шифрования (только локальный сервер)</option>}
-            </select>
-          </div>
-        </div>
-        <div className="grid-2">
-          {text("smtp_user", "Логин", "you@example.com", "Обычно — адрес почты целиком.")}
-          {passwordInput}
-        </div>
+        {oauth ? (
+          <OAuthLogin />
+        ) : (
+          <>
+            <div className="row">
+              <span className="label">Почтовый сервис</span>
+              {PRESETS.map((p) => (
+                <button key={p.host} type="button" className="chip" aria-pressed={limits.smtp_host === p.host} onClick={() => set({ smtp_host: p.host, smtp_port: p.port, smtp_security: p.security })}>{p.label}</button>
+              ))}
+            </div>
+            {preset && <span className="hint">{preset.how}</span>}
+            <div className="grid-3">
+              {text("smtp_host", "SMTP-сервер", "smtp.example.com")}
+              {num("smtp_port", "Порт", "465 — SSL, 587 — STARTTLS.", 1, 65535)}
+              <div className="field">
+                <label htmlFor="smtp_security">Шифрование</label>
+                <select id="smtp_security" className="select" style={{ height: 34 }} value={limits.smtp_security ?? "ssl"} onChange={(e) => set({ smtp_security: e.target.value as Settings["smtp_security"] })}>
+                  <option value="ssl">SSL/TLS (обычно порт 465)</option>
+                  <option value="starttls">STARTTLS (обычно порт 587)</option>
+                  {limits.smtp_security === "plain" && <option value="plain">без шифрования (только локальный сервер)</option>}
+                </select>
+              </div>
+            </div>
+            <div className="grid-2">
+              {text("smtp_user", "Логин", "you@example.com", "Обычно — адрес почты целиком.")}
+              {passwordInput}
+            </div>
+          </>
+        )}
         <div className="grid-3">
           {text("mail_from_name", "Имя отправителя", "Иван Петров", "Так письмо подписано в ящике получателя.")}
-          {text("mail_from_email", "Адрес отправителя", "пусто — логин", "Должен принадлежать этому ящику, иначе письма попадут в спам.")}
+          {text("mail_from_email", "Адрес отправителя", oauth ? "пусто — адрес входа" : "пусто — логин", "Должен принадлежать этому ящику, иначе письма попадут в спам.")}
           {text("mail_reply_to", "Куда отвечать", "пусто — на адрес отправителя")}
         </div>
         <div className="row" style={{ alignItems: "center" }}>
@@ -85,16 +241,16 @@ export function MailSettingsCard({ limits, setLimits, passwordInput }: { limits:
         <span className="hint">Проверяется сохранённая настройка — после правок сначала «Сохранить».</span>
 
         <span className="label">Правила рассылки</span>
+        <p className="small muted" style={{ margin: 0 }}>
+          Без спама: одно письмо на сайт и на адрес — по всем сканам, повторных писем нет. Сетям (точкам одного бренда или сайта) и госорганизациям (школы, поликлиники,
+          исполкомы, сайты на gov.by, gov.uk и т. п.) рассылка не пишет. Правила проверяются при постановке в очередь и ещё раз перед отправкой.
+        </p>
         <div className="grid-3">
           {num("mail_daily_limit", "Писем в день", "Новому ящику — 20–30, потом можно больше. Много сразу — письма начнут уходить в спам.", 1, 2000)}
           {num("mail_interval_min", "Пауза от, сек", "Между письмами — случайная пауза в этих пределах.", 10, 86400)}
           {num("mail_interval_max", "Пауза до, сек", "Например, 120–300: 2–5 минут.", 10, 86400)}
-          {num("mail_window_start", "Отправлять с, час", "По вашему времени.", 0, 23)}
-          {num("mail_window_end", "Отправлять до, час", "Конец не позже начала — круглые сутки.", 1, 24)}
-          <label className="check">
-            <input type="checkbox" checked={!!limits.mail_weekdays_only} onChange={(e) => set({ mail_weekdays_only: e.target.checked })} />
-            <span><b>Только по будням</b></span>
-          </label>
+          {num("mail_window_start", "Рабочее время с, час", "По местному времени получателя — часовой пояс по городу скана.", 6, 21)}
+          {num("mail_window_end", "Рабочее время до, час", "Только днём (6–22) и только по будням.", 7, 22)}
         </div>
         <label className="check">
           <input type="checkbox" checked={!!limits.mail_attach_report} onChange={(e) => set({ mail_attach_report: e.target.checked })} />
@@ -213,7 +369,7 @@ export default function MailPage() {
       <div className="page-head">
         <div>
           <h1>Рассылка</h1>
-          <p className="sub">{s?.configured ? `Письма уходят с ${s.from} по одному` : "Почта ещё не настроена"}</p>
+          <p className="sub">{s?.configured ? `Письма уходят с ${s.from} по одному${s.auth !== "password" ? " · вход через аккаунт" : ""}` : "Почта ещё не настроена"}</p>
         </div>
       </div>
       {s && !s.configured && (
@@ -235,8 +391,7 @@ export default function MailPage() {
           </div>
           <div className="small muted">
             Сегодня отправлено {s.sent_today} из {s.daily_limit} · в очереди {s.queued}
-            {s.failed ? ` · не ушло ${s.failed}` : ""} · окно {s.window.end <= s.window.start ? "круглые сутки" : `${s.window.start}:00–${s.window.end}:00`}
-            {s.window.weekdays_only ? ", по будням" : ""} · пауза {fmtPause(s.interval.min, s.interval.max)}
+            {s.failed ? ` · не ушло ${s.failed}` : ""} · по будням {s.window.start}:00–{s.window.end}:00 по времени получателя · пауза {fmtPause(s.interval.min, s.interval.max)}
             {s.attach_report ? " · с PDF-разбором" : ""} · <Link to="/settings#mail">правила</Link>
           </div>
           {info?.stop_reason && <div className="banner warn small"><span>{info.stop_reason}</span></div>}
@@ -274,7 +429,7 @@ export function MailQueueBar({ ids, label }: { ids: number[]; label: string }) {
   const [source, setSource] = useState<MailSource>("draft_or_template");
   const [skipContacted, setSkipContacted] = useState(true);
   const queue = useMutation({
-    mutationFn: () => api.queueMail({ ids, source, skip_contacted: skipContacted, skip_sent: true }),
+    mutationFn: () => api.queueMail({ ids, source, skip_contacted: skipContacted }),
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: ["mail-status"] });
       qc.invalidateQueries({ queryKey: ["outbox"] });
@@ -308,8 +463,9 @@ export function MailQueueBar({ ids, label }: { ids: number[]; label: string }) {
         <button type="button" className="btn btn-primary" onClick={() => queue.mutate()} disabled={queue.isPending || ids.length === 0}>Поставить в очередь ({ids.length})</button>
       </div>
       <span className="small faint">
-        Письмо уходит на почту компании (не на адрес для вакансий). Без почты, без проверки сайта и тем, кому уже отправляли, — пропуск. Отправка начнётся после «Запустить
-        рассылку» на странице <Link to="/mail">«Рассылка»</Link>; там же можно поправить любое письмо.
+        Письмо уходит на почту компании (не на адрес для вакансий). Пропуск: без почты, без проверки сайта, если этому сайту или адресу уже писали (одно письмо на сайт),
+        сетям и госорганизациям — причина видна в списке. Отправка начнётся после «Запустить рассылку» на странице <Link to="/mail">«Рассылка»</Link>; там же можно
+        поправить любое письмо.
       </span>
       <ErrorLine error={queue.error} />
       {r && (

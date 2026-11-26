@@ -518,14 +518,30 @@ export interface MailStatus {
   failed: number;
   sent_today: number;
   daily_limit: number;
-  in_window: boolean;
-  window: { start: number; end: number; weekdays_only: boolean };
+  /** Как входим в почту: `password` или сервис входа через аккаунт (`google`, `yandex`, `microsoft`). */
+  auth: string;
+  /** Рабочее время — по будням и по местному времени получателя (часовой пояс — по городу скана). */
+  window: { start: number; end: number; weekdays_only: boolean; recipient_time: boolean };
   interval: { min: number; max: number };
   attach_report: boolean;
   info: { next_at: string | null; waiting: string | null; stop_reason: string | null; last_error: string | null; sending: number | null };
 }
 
 export type MailSource = "draft" | "template" | "draft_or_template";
+
+export type OAuthProviderId = "google" | "yandex" | "microsoft";
+
+/** Вход в почту через аккаунт: подключён ли, какие приложения OAuth заданы, адрес возврата для их настроек. */
+export interface OAuthStatus {
+  connected: boolean;
+  provider: OAuthProviderId | "";
+  email: string;
+  redirect_uri: string | null;
+  redirect_error: string | null;
+  last_ok: string | null;
+  last_error: string | null;
+  providers: { id: OAuthProviderId; name: string; needs_secret: boolean; client_id: string; secret_set: boolean }[];
+}
 
 export interface AiBatch {
   running: boolean;
@@ -636,6 +652,16 @@ export interface Settings {
   smtp_security: "ssl" | "starttls" | "plain";
   smtp_user: string;
   smtp_password: KeyState;
+  /** `password` — пароль приложения, `oauth` — вход через аккаунт Google, Яндекса или Microsoft. */
+  smtp_auth: "password" | "oauth";
+  oauth_google_id: string;
+  oauth_google_secret: KeyState;
+  oauth_yandex_id: string;
+  oauth_yandex_secret: KeyState;
+  oauth_microsoft_id: string;
+  oauth_provider: OAuthProviderId | "";
+  oauth_email: string;
+  oauth_connected: boolean;
   mail_from_name: string;
   mail_from_email: string;
   mail_reply_to: string;
@@ -644,7 +670,6 @@ export interface Settings {
   mail_daily_limit: number;
   mail_window_start: number;
   mail_window_end: number;
-  mail_weekdays_only: boolean;
   mail_attach_report: boolean;
   mail_footer: string;
   mail_footer_en: string;
@@ -737,7 +762,10 @@ export const api = {
   mailPause: () => post<MailStatus>("/mail/pause"),
   mailTest: (to?: string) => post<{ ok: boolean; to: string }>("/mail/test", { to }),
   outbox: () => call<OutboxRow[]>("/mail/outbox"),
-  queueMail: (body: { ids: number[]; source: MailSource; skip_contacted?: boolean; skip_sent?: boolean }) =>
+  oauthStatus: () => call<OAuthStatus>("/mail/oauth/status"),
+  oauthStart: (body: { provider: OAuthProviderId; client_id?: string; client_secret?: string }) => post<{ url: string; redirect_uri: string }>("/mail/oauth/start", body),
+  oauthDisconnect: () => post<{ ok: boolean }>("/mail/oauth/disconnect"),
+  queueMail: (body: { ids: number[]; source: MailSource; skip_contacted?: boolean }) =>
     post<{ queued: number; skipped: { id: number; name: string; reason: string }[] }>("/mail/queue", body),
   queueOne: (id: number, body: { message_id?: number; to: string; subject: string; body: string }) => post<Message>(`/businesses/${id}/mail`, body),
   unqueue: (mid: number) => post<{ ok: boolean }>(`/messages/${mid}/unqueue`),

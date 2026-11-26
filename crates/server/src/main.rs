@@ -11,6 +11,7 @@ mod cli_audit;
 mod db;
 mod jobs;
 mod mail;
+mod oauth;
 mod settings;
 
 use std::net::SocketAddr;

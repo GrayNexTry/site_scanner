@@ -214,6 +214,32 @@ pub struct OutboxRow {
     pub lead_status: String,
 }
 
+/// Письмо, которое уже ушло, уходит или стоит в очереди, — для правила «одно письмо на сайт и адрес».
+#[derive(Debug, Clone)]
+pub struct MailContact {
+    pub message_id: i64,
+    pub business_id: i64,
+    /// `queued`, `sending` или `sent` (отправленное рассылкой или отмеченное вручную).
+    pub status: String,
+    pub to_addr: Option<String>,
+    /// Когда отправлено или поставлено в очередь.
+    pub at: Option<String>,
+    pub name: String,
+    pub website: Option<String>,
+    pub site_url: Option<String>,
+    pub final_url: Option<String>,
+    pub state: Option<String>,
+}
+
+/// Письмо в очереди с тем, что нужно для часового пояса получателя.
+#[derive(Debug, Clone)]
+pub struct QueuedMail {
+    pub message_id: i64,
+    pub country: Option<String>,
+    pub lat: Option<f64>,
+    pub lon: Option<f64>,
+}
+
 /// Правки полей работы с лидом. `None` — не трогать; пустая строка / `Some(None)` — очистить.
 #[derive(Debug, Default)]
 pub struct MetaPatch {
@@ -1013,16 +1039,6 @@ impl Db {
         .await
     }
 
-    /// Письма компании этого вида в работе рассылки: (в очереди или отправляется, уже отправлено).
-    pub async fn mail_state(&self, business_id: i64) -> anyhow::Result<(bool, bool)> {
-        self.call(move |c| {
-            let queued = c.query_row("SELECT EXISTS(SELECT 1 FROM messages WHERE business_id=?1 AND kind='email' AND status IN ('queued','sending'))", [business_id], |r| r.get(0))?;
-            let sent = c.query_row("SELECT EXISTS(SELECT 1 FROM messages WHERE business_id=?1 AND kind='email' AND status='sent')", [business_id], |r| r.get(0))?;
-            Ok((queued, sent))
-        })
-        .await
-    }
-
     /// Поставить письмо в рассылку (адрес, текст по желанию); снимает прошлую ошибку.
     pub async fn queue_message(&self, id: i64, to: String, subject: Option<String>, body: Option<String>) -> anyhow::Result<Option<Message>> {
         self.call(move |c| {
@@ -1045,18 +1061,76 @@ impl Db {
         self.call(move |c| Ok(c.execute("UPDATE messages SET status='draft', queued_at=NULL, updated_at=?2 WHERE id=?1 AND status IN ('queued','failed')", params![id, now()])? > 0)).await
     }
 
-    /// Следующее письмо очереди и пометка «отправляется» (чтобы не отправить дважды). None — очередь пуста.
-    pub async fn claim_next_mail(&self) -> anyhow::Result<Option<Message>> {
+    /// Все письма рассылки в работе и отправленные (в том числе отмеченные вручную) с сайтом компании —
+    /// для правила «одно письмо на сайт и адрес».
+    pub async fn mail_contacts(&self) -> anyhow::Result<Vec<MailContact>> {
         self.call(|c| {
-            let tx = c.transaction()?;
-            let m = tx
-                .query_row(&format!("SELECT {MESSAGE_COLS} FROM messages WHERE status='queued' AND kind='email' ORDER BY queued_at, id LIMIT 1"), [], message_row)
-                .optional()?;
-            if let Some(m) = &m {
-                tx.execute("UPDATE messages SET status='sending', updated_at=?2 WHERE id=?1 AND status='queued'", params![m.id, now()])?;
+            let mut st = c.prepare(
+                "SELECT m.id, m.business_id, m.status, m.to_addr, COALESCE(m.sent_at, m.queued_at, m.created_at),
+                        COALESCE(NULLIF(b.display_name,''), b.name), COALESCE(b.website_override, b.website), b.site_url,
+                        json_extract(b.site,'$.final_url'), json_extract(b.report,'$.mini.state')
+                 FROM messages m JOIN businesses b ON b.id=m.business_id
+                 WHERE m.kind='email' AND m.direction='out' AND m.status IN ('queued','sending','sent')",
+            )?;
+            st.query_map([], |r| {
+                Ok(MailContact {
+                    message_id: r.get(0)?,
+                    business_id: r.get(1)?,
+                    status: r.get(2)?,
+                    to_addr: r.get(3)?,
+                    at: r.get(4)?,
+                    name: r.get(5)?,
+                    website: r.get(6)?,
+                    site_url: r.get(7)?,
+                    final_url: r.get::<_, Option<String>>(8).ok().flatten(),
+                    state: r.get::<_, Option<String>>(9).ok().flatten(),
+                })
+            })?
+            .collect()
+        })
+        .await
+    }
+
+    /// Проверенные сайты компаний всех сканов с координатами — чтобы узнать сеть по одному сайту у многих точек
+    /// в разных сканах (как `scan_site_urls` внутри скана).
+    pub async fn site_points(&self) -> anyhow::Result<Vec<(String, Option<f64>, Option<f64>)>> {
+        self.call(|c| {
+            let mut st = c.prepare("SELECT site_url, lat, lon FROM businesses WHERE site_url IS NOT NULL")?;
+            st.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?.collect()
+        })
+        .await
+    }
+
+    /// Очередь рассылки по порядку постановки — со страной скана и координатами компании (или центра скана).
+    pub async fn queued_mail(&self) -> anyhow::Result<Vec<QueuedMail>> {
+        self.call(|c| {
+            let mut st = c.prepare(
+                "SELECT m.id, json_extract(s.params,'$.country'),
+                        COALESCE(b.lat, json_extract(s.params,'$.center.lat')), COALESCE(b.lon, json_extract(s.params,'$.center.lon'))
+                 FROM messages m JOIN businesses b ON b.id=m.business_id LEFT JOIN scans s ON s.id=b.scan_id
+                 WHERE m.status='queued' AND m.kind='email' ORDER BY m.queued_at, m.id",
+            )?;
+            st.query_map([], |r| {
+                Ok(QueuedMail {
+                    message_id: r.get(0)?,
+                    country: r.get::<_, Option<String>>(1).ok().flatten(),
+                    lat: r.get::<_, Option<f64>>(2).ok().flatten(),
+                    lon: r.get::<_, Option<f64>>(3).ok().flatten(),
+                })
+            })?
+            .collect()
+        })
+        .await
+    }
+
+    /// Взять письмо очереди в отправку (пометка «отправляется», чтобы не отправить дважды). None — его уже взяли или убрали.
+    pub async fn claim_mail(&self, id: i64) -> anyhow::Result<Option<Message>> {
+        self.call(move |c| {
+            let n = c.execute("UPDATE messages SET status='sending', updated_at=?2 WHERE id=?1 AND status='queued' AND kind='email'", params![id, now()])?;
+            if n == 0 {
+                return Ok(None);
             }
-            tx.commit()?;
-            Ok(m)
+            c.query_row(&format!("SELECT {MESSAGE_COLS} FROM messages WHERE id=?1"), [id], message_row).optional()
         })
         .await
     }

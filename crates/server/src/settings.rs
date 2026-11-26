@@ -77,6 +77,23 @@ pub struct Settings {
     pub smtp_user: String,
     /// Пароль приложения (секрет).
     pub smtp_password: String,
+    /// Как входить в почту: `password` — логин и пароль приложения, `oauth` — вход через аккаунт
+    /// (Google, Яндекс, Microsoft) без пароля в программе.
+    pub smtp_auth: String,
+    /// Свои приложения OAuth — их регистрирует владелец ящика (бесплатно, один раз): Client ID и Client secret.
+    pub oauth_google_id: String,
+    pub oauth_google_secret: String,
+    pub oauth_yandex_id: String,
+    pub oauth_yandex_secret: String,
+    pub oauth_microsoft_id: String,
+    /// Подключённый вход через аккаунт: сервис (`google`, `yandex`, `microsoft`) и адрес ящика.
+    pub oauth_provider: String,
+    pub oauth_email: String,
+    /// Токены входа (секрет, наружу не отдаются): долгий — для обновления, короткий — для отправки.
+    pub oauth_refresh_token: String,
+    pub oauth_access_token: String,
+    /// Когда истекает короткий токен, Unix-время в секундах.
+    pub oauth_expires_at: i64,
     pub mail_from_name: String,
     /// Адрес отправителя; пусто — логин SMTP.
     pub mail_from_email: String,
@@ -87,11 +104,10 @@ pub struct Settings {
     pub mail_interval_max: u64,
     /// Писем в день, не больше (новому ящику — 20–30, иначе письма уходят в спам).
     pub mail_daily_limit: u32,
-    /// Окно отправки по вашему времени: с какого часа и до какого.
+    /// Рабочее время по местному времени получателя (часовой пояс — по городу скана): с какого часа и до какого.
+    /// Только днём (6–22) и только по будням — круглосуточной рассылки и выходных нет.
     pub mail_window_start: u32,
     pub mail_window_end: u32,
-    /// Только по будням.
-    pub mail_weekdays_only: bool,
     /// Прикладывать PDF-разбор сайта (кроме компаний без сайта).
     pub mail_attach_report: bool,
     /// Строка в конце письма — как отказаться от писем (по-русски и по-английски).
@@ -145,6 +161,17 @@ impl Default for Settings {
             smtp_security: "ssl".into(),
             smtp_user: String::new(),
             smtp_password: String::new(),
+            smtp_auth: "password".into(),
+            oauth_google_id: String::new(),
+            oauth_google_secret: String::new(),
+            oauth_yandex_id: String::new(),
+            oauth_yandex_secret: String::new(),
+            oauth_microsoft_id: String::new(),
+            oauth_provider: String::new(),
+            oauth_email: String::new(),
+            oauth_refresh_token: String::new(),
+            oauth_access_token: String::new(),
+            oauth_expires_at: 0,
             mail_from_name: String::new(),
             mail_from_email: String::new(),
             mail_reply_to: String::new(),
@@ -152,8 +179,7 @@ impl Default for Settings {
             mail_interval_max: 300,
             mail_daily_limit: 25,
             mail_window_start: 9,
-            mail_window_end: 19,
-            mail_weekdays_only: true,
+            mail_window_end: 18,
             mail_attach_report: true,
             mail_footer: "Если это неактуально, просто ответьте «нет» — больше писать не буду.".into(),
             mail_footer_en: "If this isn't relevant, just reply \"no\" and I won't write again.".into(),
@@ -162,7 +188,17 @@ impl Default for Settings {
     }
 }
 
-const KEY_FIELDS: &[&str] = &["google_places_key", "yandex_geosearch_key", "psi_key", "safe_browsing_key", "brave_search_key", "yandex_search_key", "proxy_url", "openrouter_key", "smtp_password"];
+const KEY_FIELDS: &[&str] = &[
+    "google_places_key", "yandex_geosearch_key", "psi_key", "safe_browsing_key", "brave_search_key", "yandex_search_key", "proxy_url", "openrouter_key",
+    "smtp_password", "oauth_google_secret", "oauth_yandex_secret",
+];
+
+/// Токены входа в почту: в интерфейс не отдаются вовсе (только «подключено» и адрес).
+const HIDDEN_FIELDS: &[&str] = &["oauth_refresh_token", "oauth_access_token", "oauth_expires_at"];
+
+/// Границы «днём»: раньше 6 и позже 22 письма не уходят.
+const DAY_START: u32 = 6;
+const DAY_END: u32 = 22;
 
 /// Маска секрета: последние 4 символа — только у длинных значений (ключи API); короткий пароль не показываем совсем.
 fn mask(k: &str) -> Value {
@@ -217,9 +253,26 @@ impl Settings {
             .unwrap_or_default()
     }
 
-    /// Почта для рассылки заполнена: сервер, логин, пароль и адрес отправителя.
+    /// Почта для рассылки заполнена: сервер, логин, пароль (или вход через аккаунт) и адрес отправителя.
     pub fn mail_configured(&self) -> bool {
-        !self.smtp_host.trim().is_empty() && !self.smtp_user.trim().is_empty() && !self.smtp_password.is_empty() && self.mail_from().contains('@')
+        let auth = if self.oauth() { self.oauth_connected() } else { !self.smtp_password.is_empty() };
+        !self.smtp_host.trim().is_empty() && !self.smtp_user.trim().is_empty() && auth && self.mail_from().contains('@')
+    }
+
+    /// Вход через аккаунт, а не пароль приложения.
+    pub fn oauth(&self) -> bool {
+        self.smtp_auth == "oauth"
+    }
+
+    pub fn oauth_connected(&self) -> bool {
+        !self.oauth_provider.is_empty() && !self.oauth_refresh_token.is_empty()
+    }
+
+    /// Рабочее время отправки (с, до) — всегда днём; старые значения вне границ (в том числе «круглые сутки»)
+    /// превращаются в 9–18.
+    pub fn mail_window(&self) -> (u32, u32) {
+        let (a, b) = (self.mail_window_start, self.mail_window_end);
+        if a >= DAY_START && b <= DAY_END && b > a { (a, b) } else { (9, 18) }
     }
 
     /// Адрес отправителя: заданный или логин SMTP.
@@ -238,12 +291,21 @@ impl Settings {
         }
     }
 
-    /// Для интерфейса: ключи — только «задан/нет» и последние 4 символа.
+    /// Для интерфейса: ключи — только «задан/нет» и последние 4 символа; токены входа — не отдаются.
     pub fn public(&self) -> Value {
         let mut v = serde_json::to_value(self).unwrap_or_default();
         for f in KEY_FIELDS {
             let k = v[f].as_str().unwrap_or("").to_string();
             v[f] = mask(&k);
+        }
+        if let Some(o) = v.as_object_mut() {
+            for f in HIDDEN_FIELDS {
+                o.remove(*f);
+            }
+            o.insert("oauth_connected".into(), json!(self.oauth_connected()));
+            let (a, b) = self.mail_window();
+            o.insert("mail_window_start".into(), json!(a));
+            o.insert("mail_window_end".into(), json!(b));
         }
         v
     }
@@ -276,6 +338,15 @@ impl Settings {
         key("smtp_host", &mut self.smtp_host);
         key("smtp_user", &mut self.smtp_user);
         key("smtp_password", &mut self.smtp_password);
+        key("oauth_google_id", &mut self.oauth_google_id);
+        key("oauth_google_secret", &mut self.oauth_google_secret);
+        key("oauth_yandex_id", &mut self.oauth_yandex_id);
+        key("oauth_yandex_secret", &mut self.oauth_yandex_secret);
+        key("oauth_microsoft_id", &mut self.oauth_microsoft_id);
+        // Токены входа приходят только из окна входа сервиса (oauth.rs), не из формы настроек.
+        if let Some(a) = patch.get("smtp_auth").and_then(Value::as_str).filter(|v| ["password", "oauth"].contains(v)) {
+            self.smtp_auth = a.to_string();
+        }
         key("mail_from_name", &mut self.mail_from_name);
         key("mail_from_email", &mut self.mail_from_email);
         key("mail_reply_to", &mut self.mail_reply_to);
@@ -344,12 +415,16 @@ impl Settings {
         if let Some(x) = num("mail_daily_limit", 1, 2000) {
             self.mail_daily_limit = x as u32;
         }
-        if let Some(x) = num("mail_window_start", 0, 23) {
+        if let Some(x) = num("mail_window_start", DAY_START as u64, DAY_END as u64 - 1) {
             self.mail_window_start = x as u32;
         }
-        if let Some(x) = num("mail_window_end", 1, 24) {
+        if let Some(x) = num("mail_window_end", DAY_START as u64 + 1, DAY_END as u64) {
             self.mail_window_end = x as u32;
         }
+        // Конец раньше начала — окно в один час, а не «круглые сутки».
+        let (a, b) = (self.mail_window_start.clamp(DAY_START, DAY_END - 1), self.mail_window_end);
+        self.mail_window_start = a;
+        self.mail_window_end = if b > a && b <= DAY_END { b } else { a + 1 };
         let flag = |name: &str, target: &mut bool| {
             if let Some(b) = patch.get(name).and_then(Value::as_bool) {
                 *target = b;
@@ -361,7 +436,6 @@ impl Settings {
         flag("search_free", &mut self.search_free);
         flag("render_js", &mut self.render_js);
         flag("proxy_always", &mut self.proxy_always);
-        flag("mail_weekdays_only", &mut self.mail_weekdays_only);
         flag("mail_attach_report", &mut self.mail_attach_report);
     }
 }
@@ -413,7 +487,30 @@ mod tests {
         assert_eq!(s.public()["smtp_password"]["hint"], "••••", "короткий пароль не показываем даже частично");
         s.apply(&json!({"smtp_password": "app-pass-SECRET"}));
         assert!(s.mail_configured() && s.mail_from() == "me@example.com");
-        assert_eq!((s.smtp_security.as_str(), s.mail_interval_min, s.mail_interval_max, s.mail_window_end), ("ssl", 10, 10, 24));
+        assert_eq!((s.smtp_security.as_str(), s.mail_interval_min, s.mail_interval_max, s.mail_window_end), ("ssl", 10, 10, 22));
+        // Окно — только днём: «круглые сутки» и ночь не сохраняются.
+        s.apply(&json!({"mail_window_start": 0, "mail_window_end": 24}));
+        assert_eq!((s.mail_window_start, s.mail_window_end), (6, 22));
+        s.apply(&json!({"mail_window_start": 15, "mail_window_end": 9}));
+        assert_eq!(s.mail_window(), (15, 16));
+        let legacy = Settings { mail_window_start: 9, mail_window_end: 0, ..Default::default() };
+        assert_eq!(legacy.mail_window(), (9, 18), "старое «круглые сутки» → 9–18");
+        // Вход через аккаунт: секрет приложения маскируется, токены наружу не отдаются и формой не меняются.
+        s.apply(&json!({"smtp_auth": "oauth", "oauth_google_id": "123.apps.googleusercontent.com", "oauth_google_secret": "GOCSPX-SECRETsecret", "oauth_refresh_token": "1//hack"}));
+        assert!(s.oauth() && !s.oauth_connected() && !s.mail_configured(), "без входа почта не настроена");
+        s.oauth_provider = "google".into();
+        s.oauth_refresh_token = "1//REFRESHsecret".into();
+        s.oauth_access_token = "ya29.ACCESSsecret".into();
+        assert!(s.mail_configured());
+        let p = s.public();
+        for secret in ["GOCSPX-SECRET", "REFRESHsecret", "ACCESSsecret"] {
+            assert!(!p.to_string().contains(secret), "{secret}: {p}");
+        }
+        assert!(p.get("oauth_refresh_token").is_none() && p.get("oauth_access_token").is_none());
+        assert_eq!(p["oauth_connected"], true);
+        assert_eq!(p["oauth_google_id"], "123.apps.googleusercontent.com");
+        s.apply(&json!({"smtp_auth": "magic"}));
+        assert_eq!(s.smtp_auth, "oauth");
         assert!(!s.mail_running, "рассылка включается только кнопкой");
         s.apply(&json!({"ai_profiles": []}));
         assert_eq!((s.ai_profiles.len(), s.ai_profile.as_str()), (1, "default"), "пустой список → профиль по умолчанию");
