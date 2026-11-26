@@ -61,14 +61,21 @@ fn tls_checks(s: &SiteSnapshot, https: bool, out: &mut Vec<MetricResult>) {
                 (true, false) => " — но ссылка ведёт на http://, перенаправления на https нет",
                 _ => "",
             };
-            out.push(if !t.valid {
-                MetricResult::fail("B04", format!("Сертификат не проходит проверку: {}", t.error.clone().unwrap_or_default()))
+            out.push(if s.tls_unread() && !s.tls_lenient {
+                // Проба не достучалась (сеть, геоблок), а страница по https открылась со строгой
+                // проверкой сертификата: сертификат рабочий, но срок и издателя не узнать.
+                MetricResult::na(
+                    "B04",
+                    format!("Сертификат прочитать не удалось ({}), но сайт по https открывается с проверкой сертификата{note}", t.error.clone().unwrap_or_default()),
+                )
+            } else if !t.valid {
+                MetricResult::fail("B04", format!("Сертификат не проходит проверку: {}", t.error.clone().unwrap_or_default())).with_value(days)
             } else if days < 14 {
-                MetricResult::warn("B04", format!("Сертификат истекает через {days} дн.{note}"))
+                MetricResult::warn("B04", format!("Сертификат истекает через {days} дн.{note}")).with_value(days)
             } else {
                 MetricResult::pass("B04", format!("Валиден, {days} дн. до истечения ({}){note}", t.issuer.clone().unwrap_or_default()))
-            }
-            .with_value(days));
+                    .with_value(days)
+            });
         }
         (None, true) => out.push(MetricResult::na("B04", "TLS-проба не выполнена")),
     }
@@ -183,7 +190,10 @@ pub fn run(ctx: &CheckCtx, v: &SiteView, out: &mut Vec<MetricResult>) {
             let internal_links = page.links.iter().filter(|l| l.internal).count();
             (page.words < 5 && internal_links == 0 && page.links.len() < 3 && !s.js_shell && !rendered_something).then(|| page.text.trim().to_string())
         });
-    out.push(if !home.ok() {
+    out.push(if !home.ok() && parked.is_some() && page.words < 120 {
+        // Адрес из карточки ведёт на страницу хостера («Сайт не обслуживается», 404): сайта по факту нет — заглушка.
+        MetricResult::fail("B01", format!("Вместо сайта — заглушка хостинга «{}» (ответ {})", parked.unwrap_or(&""), home.status)).with_value(home.status)
+    } else if !home.ok() {
         MetricResult::fail("B01", format!("Главная отвечает {}", home.status)).with_value(home.status)
     } else if let Some(m) = parked {
         MetricResult::fail("B01", format!("Похоже на заглушку хостинга или парковку домена: «{m}»"))
@@ -217,6 +227,9 @@ pub fn run(ctx: &CheckCtx, v: &SiteView, out: &mut Vec<MetricResult>) {
             MetricResult::fail("B05", "HTTPS есть, но http:// не перенаправляет на него — по такой ссылке (в том числе из карточки) браузер пишет «Не защищено»")
                 .with_value("no_redirect"),
         );
+    } else if !v.https() && s.tls.as_ref().is_some_and(|t| t.error.is_some() && t.issuer.is_some()) {
+        // HTTPS отвечает, но сертификат просрочен или чужой — «только по HTTP» звучало бы неверно.
+        out.push(MetricResult::fail("B05", "Перенаправления на https нет, а сам HTTPS не работает — сертификат не проходит проверку (см. B04)"));
     } else if !v.https() {
         out.push(MetricResult::fail("B05", "Сайт отдаётся только по HTTP"));
     } else if let Some(p) = &s.http_probe {
@@ -539,11 +552,12 @@ pub fn run(ctx: &CheckCtx, v: &SiteView, out: &mut Vec<MetricResult>) {
     let mut broken: Vec<String> = s
         .pages
         .iter()
-        // 429 и 503 — «слишком много запросов» и временная перегрузка, а не битая ссылка.
-        .filter(|p| p.status.is_some_and(|st| st >= 400 && !matches!(st, 403 | 429 | 503)) && !p.url.contains("/cdn-cgi/"))
+        // 429 и 503 — «слишком много запросов» и временная перегрузка, а не битая ссылка;
+        // 401 — страница под паролем (belodent.by/prices/): закрыта намеренно, не битая.
+        .filter(|p| p.status.is_some_and(|st| st >= 400 && !matches!(st, 401 | 403 | 429 | 503)) && !p.url.contains("/cdn-cgi/"))
         .map(|p| format!("{} ({})", p.url, p.status.unwrap_or(0)))
         .collect();
-    broken.extend(s.link_checks.iter().filter(|c| c.http_error() && !matches!(c.final_status, Some(403 | 429 | 503)) && !c.url.contains("/cdn-cgi/")).map(|c| format!("{} ({})", c.url, c.final_status.unwrap_or(0))));
+    broken.extend(s.link_checks.iter().filter(|c| c.http_error() && !matches!(c.final_status, Some(401 | 403 | 429 | 503)) && !c.url.contains("/cdn-cgi/")).map(|c| format!("{} ({})", c.url, c.final_status.unwrap_or(0))));
     let silent = s.pages.iter().filter(|p| p.status.is_none()).count() + s.link_checks.iter().filter(|c| c.unreachable()).count();
     let checked = s.pages.len() + s.link_checks.len() - silent;
     let silent_note = match (silent, s.throttled) {
@@ -581,6 +595,9 @@ pub fn run(ctx: &CheckCtx, v: &SiteView, out: &mut Vec<MetricResult>) {
     }
     let dup_t = titles.values().filter(|c| **c > 1).map(|c| c - 1).sum::<usize>();
     let dup_d = descs.values().filter(|c| **c > 1).map(|c| c - 1).sum::<usize>();
+    // Сколько страниц делят повторяющиеся заголовки / описания (с «первой» из каждой группы).
+    let pages_t = titles.values().filter(|c| **c > 1).sum::<usize>();
+    let pages_d = descs.values().filter(|c| **c > 1).sum::<usize>();
     if v.pages.len() < 2 {
         out.push(MetricResult::na("C14", "Обойдена одна страница"));
     } else {
@@ -588,7 +605,7 @@ pub fn run(ctx: &CheckCtx, v: &SiteView, out: &mut Vec<MetricResult>) {
             MetricResult::new(
                 "C14",
                 match dup_t + dup_d { 0 => Status::Pass, 1..=2 => Status::Warn, _ => Status::Fail },
-                format!("Повторов title: {dup_t}, description: {dup_d} на {} страницах", v.pages.len()),
+                format!("Повторов title: {dup_t}, description: {dup_d} на {} страницах (одинаковый title у {pages_t} стр., description у {pages_d} стр.)", v.pages.len()),
             )
             .with_value(dup_t + dup_d),
         );
@@ -633,6 +650,7 @@ pub fn run(ctx: &CheckCtx, v: &SiteView, out: &mut Vec<MetricResult>) {
             .filter(|u| u.contains('?') || u.contains("jsessionid") || u.contains("index.php") || u.contains("&id=") || u.contains("?id="))
             .count();
         let share = dirty as f64 / urls.len() as f64;
+        // Адреса «нечитаемые» — когда таких большинство (порог 50 %); меньше — только у части страниц.
         out.push(
             MetricResult::new("C25", if share < 0.1 { Status::Pass } else { Status::Warn }, format!("С параметрами: {dirty} из {}", urls.len()))
                 .with_value(share),
@@ -648,11 +666,12 @@ pub fn run(ctx: &CheckCtx, v: &SiteView, out: &mut Vec<MetricResult>) {
         Some(vp) => {
             let vp_l = vp.to_lowercase().replace(' ', "");
             if vp_l.contains("user-scalable=no") || vp_l.contains("user-scalable=0") || vp_l.contains("maximum-scale=1,") || vp_l.ends_with("maximum-scale=1") || vp_l.contains("maximum-scale=1.0") {
-                MetricResult::warn("E01", format!("Масштабирование запрещено: {vp}"))
+                // viewport есть, мобильная версия работает — запрещён только щипок-масштаб.
+                MetricResult::warn("E01", format!("Масштабирование запрещено: {vp}")).with_value("no_zoom")
             } else if vp_l.contains("width=device-width") {
                 MetricResult::pass("E01", vp.to_string())
             } else {
-                MetricResult::warn("E01", format!("Нестандартный viewport: {vp}"))
+                MetricResult::warn("E01", format!("Нестандартный viewport: {vp}")).with_value("odd_viewport")
             }
         }
     });
@@ -668,8 +687,12 @@ pub fn run(ctx: &CheckCtx, v: &SiteView, out: &mut Vec<MetricResult>) {
     // ---------- O ----------
     let has = |h: &str| home.header(h).is_some();
     let csp = home.header("content-security-policy").unwrap_or("");
+    // Сайт открылся по http:// без перенаправления, а https-версия отдаёт HSTS (belarusmodels.by,
+    // centercomfort.by): по http браузер HSTS не принимает, но заголовок у сайта есть — беда в
+    // перенаправлении (B05), а не в заголовке.
+    let hsts = has("strict-transport-security") || (!v.https() && s.https_hsts());
     let checks = [
-        ("HSTS", has("strict-transport-security")),
+        ("HSTS", hsts),
         ("CSP", !csp.is_empty()),
         ("X-Content-Type-Options", has("x-content-type-options")),
         ("X-Frame-Options/frame-ancestors", has("x-frame-options") || csp.contains("frame-ancestors")),
@@ -796,7 +819,17 @@ fn speed(v: &SiteView, out: &mut Vec<MetricResult>) {
     // D12–D15: по Lighthouse, если есть; иначе приблизительно по HTML.
     let approx = " (оценка по HTML, без рендера)";
     match psi.and_then(|p| p.lcp_lazy) {
-        Some(x) => out.push(MetricResult::new("D12", if x >= 0.9 { Status::Pass } else { Status::Fail }, if x >= 0.9 { "LCP-картинка грузится сразу" } else { "LCP-картинка с loading=lazy" })),
+        // Google PageSpeed смотрит отрисованную страницу: отложенную загрузку часто ставит скрипт
+        // (Tilda, Swiper), в исходном HTML атрибута loading=lazy может не быть.
+        Some(x) => out.push(MetricResult::new(
+            "D12",
+            if x >= 0.9 { Status::Pass } else { Status::Fail },
+            if x >= 0.9 {
+                "Главная картинка первого экрана грузится сразу (Google PageSpeed)"
+            } else {
+                "Главная картинка первого экрана грузится отложенно — появляется позже остального (Google PageSpeed, ленивая загрузка)"
+            },
+        )),
         None => {
             let first_lazy = page.images.iter().find(|i| !i.tiny).is_some_and(|i| i.lazy);
             out.push(if first_lazy {

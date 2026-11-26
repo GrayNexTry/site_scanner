@@ -47,6 +47,10 @@ pub struct AppState {
     pub search: RwLock<Arc<WebSearch>>,
     pub events: broadcast::Sender<Event>,
     cancels: Mutex<HashMap<i64, Arc<AtomicBool>>>,
+    /// Нейросеть для писем: каталог моделей OpenRouter и массовая генерация.
+    pub ai: crate::ai::AiState,
+    /// Рассылка по почте: что ждёт и почему остановилась.
+    pub mail: crate::mail::MailState,
     /// Страна выхода в интернет и когда узнали (VPN меняет её на ходу).
     egress: tokio::sync::Mutex<Option<(Instant, Option<String>)>>,
 }
@@ -73,6 +77,12 @@ pub enum Mode {
 
 impl AppState {
     pub async fn new(db: Db) -> anyhow::Result<Shared> {
+        // Адрес OpenRouter можно подменить для проверок (свой совместимый сервер).
+        Self::with_ai(db, std::env::var("MAPS_SCANNER_OPENROUTER_URL").ok()).await
+    }
+
+    /// То же с заданным адресом API нейросети (None — OpenRouter).
+    pub async fn with_ai(db: Db, ai_base: Option<String>) -> anyhow::Result<Shared> {
         let settings: Settings = db
             .get_setting("settings")
             .await?
@@ -92,6 +102,8 @@ impl AppState {
             search: RwLock::new(search),
             events,
             cancels: Mutex::new(HashMap::new()),
+            ai: crate::ai::AiState::new(ai_base.as_deref())?,
+            mail: Default::default(),
             egress: tokio::sync::Mutex::new(None),
         }))
     }
@@ -136,6 +148,7 @@ impl AppState {
 
     pub async fn emit_business(&self, id: i64) {
         if let Ok(Some(b)) = self.db.business_brief(id).await {
+            let b = self.db.with_contact_summary(b.clone()).await.unwrap_or(b);
             let _ = self.events.send(Event::Business { scan_id: b.scan_id, business: Box::new(b.slim()) });
         }
     }
@@ -259,12 +272,9 @@ async fn run_scan(state: &Shared, scan_id: i64, mode: Mode, cancel: &AtomicBool)
         }
         let mut businesses = merge::merge(places);
         // Много точек с одним названием в районе — сеть: сайт у головной компании.
-        let mut names: HashMap<String, u32> = HashMap::new();
-        for b in &businesses {
-            *names.entry(normalize_name(&b.name)).or_default() += 1;
-        }
+        let names = name_chain_sizes(businesses.iter().map(|b| (b.name.as_str(), b.category.as_deref())));
         for b in &mut businesses {
-            b.chain_size = names.get(&normalize_name(&b.name)).copied().unwrap_or(1);
+            b.chain_size = name_chain_size(&names, &b.name, b.category.as_deref());
         }
         let c = params.center;
         businesses.sort_by(|a, b| {
@@ -423,22 +433,45 @@ async fn audit_scan(state: &Shared, scan_id: i64, params: &ScanParams, which: Wh
 
 /// Пять и больше компаний скана в итоге ведут на один сайт — из карточки или найденный поиском
 /// (отделения «Белпошты» → belpost.by) — это сеть: сайтом занимается головная компания.
-/// Поднимает `chain_size` у таких компаний; возвращает, у скольких поднял.
+/// Пересчитывает `chain_size` (по названию и по общему сайту); возвращает, у скольких изменил.
 async fn mark_shared_sites(state: &Shared, scan_id: i64) -> anyhow::Result<usize> {
+    // Размер сети пересчитывается целиком — и вверх, и вниз: общий «сайт», который оказался
+    // каталогом (kramba.by у 13 клиник), больше не держит у независимых клиник метку сети.
+    let all = state.db.scan_businesses(scan_id, false).await?;
     let rows = state.db.scan_site_urls(scan_id).await?;
     let sizes = shared_site_sizes(rows.iter().map(|(id, _, u)| (*id, u.as_str())));
+    let names = name_chain_sizes(all.iter().map(|(_, b)| (b.name.as_str(), b.category.as_deref())));
     let mut changed = 0;
-    for (id, data, _) in rows {
-        let Some(&n) = sizes.get(&id) else { continue };
-        let Ok(mut b) = serde_json::from_value::<Business>(data) else { continue };
-        if b.chain_size >= n {
+    for (id, mut b) in all {
+        let want = name_chain_size(&names, &b.name, b.category.as_deref()).max(sizes.get(&id).copied().unwrap_or(0));
+        if b.chain_size == want {
             continue;
         }
-        b.chain_size = n;
+        b.chain_size = want;
         state.db.update_business_data(id, serde_json::to_value(&b)?).await?;
         changed += 1;
     }
     Ok(changed)
+}
+
+/// Сколько точек района с тем же названием; общие названия-виды деятельности («Стаматалогія»,
+/// «Аптека») не считаются.
+fn name_chain_sizes<'a>(items: impl Iterator<Item = (&'a str, Option<&'a str>)>) -> HashMap<String, u32> {
+    let mut names: HashMap<String, u32> = HashMap::new();
+    for (name, category) in items {
+        if !scanner_core::discover::generic_name(name, category) {
+            *names.entry(normalize_name(name)).or_default() += 1;
+        }
+    }
+    names
+}
+
+fn name_chain_size(names: &HashMap<String, u32>, name: &str, category: Option<&str>) -> u32 {
+    if scanner_core::discover::generic_name(name, category) {
+        1
+    } else {
+        names.get(&normalize_name(name)).copied().unwrap_or(1)
+    }
 }
 
 #[allow(clippy::too_many_arguments)]

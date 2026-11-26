@@ -1,10 +1,12 @@
-import { useMemo, useState } from "react";
-import { Link, useParams } from "react-router";
+import { useEffect, useMemo, useState } from "react";
+import { Link, useLocation, useParams } from "react-router";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { api, type Business, type LeadStatus, type MetricDef, type MetricResult, type Place } from "../api";
+import { api, type Business, type MetricDef, type MetricResult, type Place } from "../api";
 import { LeadBadge, ScoreBar, StatusDot, useToast } from "../components";
 import { useScanEvents } from "../hooks";
-import { absUrl, DISCOVERY_SOURCE, fmtDate, fmtMs, hostOf, LEAD_STATUS_LABEL, PROVIDER_LABEL, scoreTone, siteOf } from "../format";
+import { ActivityCard, ContactsCard, OutreachCard, ProposalCard, WorkCard } from "./SalesBlocks";
+import { LAST_BUSINESS_KEY } from "./AiSettings";
+import { absUrl, DISCOVERY_SOURCE, fmtDate, fmtMs, hostOf, PROVIDER_LABEL, scoreTone, siteOf } from "../format";
 
 type View = "problems" | "all" | "na";
 
@@ -38,7 +40,6 @@ function Sources({ sources }: { sources: Place[] }) {
   );
 }
 
-/** Работа с лидом: статус и заметки. Заметка сохраняется, когда поле теряет фокус. */
 /** Мини-отчёт: ситуация с сайтом, что мешает и что предложить — с копированием для письма. */
 function MiniCard({ b }: { b: Business }) {
   const [toast, show] = useToast();
@@ -76,6 +77,7 @@ function MiniCard({ b }: { b: Business }) {
           <ul className="small">{m.problems.map((p) => <li key={p}>{p}</li>)}</ul>
         </>
       )}
+      {m.detail && <p className="small faint" style={{ margin: "10px 0 0" }}>Для менеджера: {m.detail}</p>}
       {m.offer.length > 0 && (
         <>
           <div className="small muted" style={{ marginTop: 10 }}>Что предложить</div>
@@ -83,41 +85,6 @@ function MiniCard({ b }: { b: Business }) {
         </>
       )}
       {toast}
-    </div>
-  );
-}
-
-function WorkCard({ b }: { b: Business }) {
-  const qc = useQueryClient();
-  const [notes, setNotes] = useState(b.notes ?? "");
-  const save = useMutation({
-    mutationFn: (patch: { lead_status?: LeadStatus; notes?: string }) => api.patchBusiness(b.id, patch),
-    onSuccess: () => {
-      qc.invalidateQueries({ queryKey: ["business", b.id] });
-      qc.invalidateQueries({ queryKey: ["businesses", b.scan_id] });
-      qc.invalidateQueries({ queryKey: ["leads"] });
-    },
-  });
-  return (
-    <div className="card card-pad stack">
-      <span className="label">Работа с лидом</span>
-      <div className="chips" role="radiogroup" aria-label="Статус лида">
-        {(Object.keys(LEAD_STATUS_LABEL) as LeadStatus[]).map((st) => (
-          <button key={st} className="chip" role="radio" aria-checked={b.lead_status === st} aria-pressed={b.lead_status === st} onClick={() => save.mutate({ lead_status: st })}>
-            {LEAD_STATUS_LABEL[st]}
-          </button>
-        ))}
-      </div>
-      <textarea
-        className="input"
-        rows={3}
-        placeholder="Заметки: с кем говорили, когда перезвонить…"
-        value={notes}
-        onChange={(e) => setNotes(e.target.value)}
-        onBlur={() => notes !== (b.notes ?? "") && save.mutate({ notes })}
-        aria-label="Заметки"
-      />
-      <span className="small faint">{save.isPending ? "Сохраняю…" : b.status_at ? `Статус изменён ${fmtDate(b.status_at)}` : "Статус и заметки видны на странице «Лиды»"}</span>
     </div>
   );
 }
@@ -201,6 +168,21 @@ export default function BusinessPage() {
 
   const defs = useMemo(() => new Map((meta.data?.catalog.metrics ?? []).map((m) => [m.id, m])), [meta.data]);
   const b = q.data?.business;
+  // Ссылка из списка скана («Написать») ведёт к блоку первого сообщения.
+  const { hash } = useLocation();
+  const loaded = !!b;
+  useEffect(() => {
+    if (hash === "#outreach" && loaded) document.getElementById("outreach")?.scrollIntoView({ block: "start" });
+  }, [hash, loaded]);
+  // Последняя открытая компания — для пробы профиля нейросети в настройках.
+  useEffect(() => {
+    if (!b) return;
+    try {
+      localStorage.setItem(LAST_BUSINESS_KEY, JSON.stringify({ id: b.id, name: q.data?.client_name || b.name }));
+    } catch {
+      /* хранилище недоступно — проба просто без подсказки */
+    }
+  }, [b?.id]);
   const results = b?.results ?? [];
   const stops = new Set(b?.report?.stop_factors ?? []);
   // Самые весомые проблемы: сначала стоп-факторы и «проблемы», затем «внимание».
@@ -248,7 +230,7 @@ export default function BusinessPage() {
         <div className="page-head">
           <div>
             <h1>{b.name}</h1>
-            <p className="sub">{[b.category, b.address, b.phone].filter(Boolean).join(" · ")}</p>
+            <p className="sub">{[b.category, b.address, b.client_phone ?? b.phone].filter(Boolean).join(" · ")}</p>
           </div>
           <div className="row">
             {siteUrl ? (
@@ -263,6 +245,18 @@ export default function BusinessPage() {
       </div>
 
       {b.audit_status === "failed" && <div className="banner error small">Проверка упала: {b.error}</div>}
+
+      <div className="grid-2" style={{ alignItems: "start" }}>
+        <WorkCard key={JSON.stringify([b.lead_status, b.notes, b.next_action, b.next_action_at, b.contact_person, b.deal_price, b.deal_currency, b.status_at, b.display_name, b.display_address, q.data?.name_suggestion])} b={b} clientName={q.data?.client_name} clientAddress={q.data?.client_address} nameSuggestion={q.data?.name_suggestion} />
+        <OutreachCard key={`${b.id}-${q.data?.outreach?.short.length ?? 0}-${q.data?.contacts.length ?? 0}`} b={b} outreach={q.data?.outreach ?? null} contacts={q.data?.contacts ?? []} messages={q.data?.messages ?? []} />
+      </div>
+
+      <div className="grid-2" style={{ alignItems: "start" }}>
+        <ContactsCard b={b} contacts={q.data?.contacts ?? []} />
+        <ActivityCard b={b} activities={q.data?.activities ?? []} />
+      </div>
+
+      <ProposalCard b={b} proposal={q.data?.proposal ?? null} />
 
       <div className="grid-3">
         <div className="card card-pad stack">
@@ -326,13 +320,10 @@ export default function BusinessPage() {
 
       <MiniCard b={b} />
 
-      <div className="grid-2" style={{ alignItems: "start" }}>
-        <WorkCard key={`${b.id}-${b.notes ?? ""}`} b={b} />
-        <DiscoveryCard b={b} />
-      </div>
+      <DiscoveryCard b={b} />
 
       {report && (
-        <div className="grid-2" style={{ gridTemplateColumns: "minmax(0, 380px) minmax(0, 1fr)", alignItems: "start" }}>
+        <div className="grid-cats">
           <div className="card">
             <div className="card-head"><h2>Категории</h2>{cat && <button className="btn btn-sm btn-ghost" onClick={() => setCat(null)}>Все</button>}</div>
             <div className="card-pad cat-list">

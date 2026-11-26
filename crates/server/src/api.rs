@@ -8,7 +8,7 @@ use axum::extract::{Path, Query, State};
 use axum::http::{header, StatusCode};
 use axum::response::sse::{Event as SseEvent, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, post};
+use axum::routing::{delete, get, post};
 use axum::{Json, Router};
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -17,13 +17,15 @@ use tokio_stream::{Stream, StreamExt};
 use tower_http::compression::CompressionLayer;
 
 use scanner_core::catalog::catalog;
+use scanner_core::mini::SiteState;
+use scanner_core::sales::{self, Contacts, ManualContact, OutreachInput, SavedProposal};
 use scanner_core::providers::{self, presets};
 use scanner_core::text::{host_of, parse_url_lenient};
-use scanner_core::{Business, LatLon, Place, ProviderKind, ScanParams};
+use scanner_core::{Business, LatLon, MetricResult, Place, ProviderKind, ScanParams};
 
 use crate::jobs::{spawn_business_audit, spawn_scan, Mode, Shared};
 
-pub struct ApiError(StatusCode, String);
+pub struct ApiError(pub StatusCode, pub String);
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
@@ -37,15 +39,15 @@ impl<E: Into<anyhow::Error>> From<E> for ApiError {
     }
 }
 
-fn bad(msg: impl Into<String>) -> ApiError {
+pub(crate) fn bad(msg: impl Into<String>) -> ApiError {
     ApiError(StatusCode::BAD_REQUEST, msg.into())
 }
 
-fn not_found() -> ApiError {
+pub(crate) fn not_found() -> ApiError {
     ApiError(StatusCode::NOT_FOUND, "не найдено".into())
 }
 
-type ApiResult<T> = Result<T, ApiError>;
+pub(crate) type ApiResult<T> = Result<T, ApiError>;
 
 pub fn router(state: Shared) -> Router {
     let api = Router::new()
@@ -63,12 +65,20 @@ pub fn router(state: Shared) -> Router {
         .route("/scans/{id}/export.csv", get(export_csv))
         .route("/businesses/{id}", get(get_business).patch(patch_business))
         .route("/leads", get(list_leads))
+        .route("/leads.csv", get(leads_csv))
+        .route("/businesses/{id}/activities", post(add_activity))
+        .route("/activities/{aid}", delete(delete_activity))
+        .route("/businesses/{id}/sent", post(mark_sent))
+        .route("/businesses/{id}/proposal.pdf", get(proposal_pdf))
         .route("/businesses/{id}/audit", post(audit_business))
+        .route("/businesses/{id}/report.pdf", get(report_pdf))
         .route("/audit", post(manual_audit))
         .route("/events", get(events))
         .route("/geocode", get(geocode))
         .route("/reverse", get(reverse))
-        .route("/net", get(net));
+        .route("/net", get(net))
+        .merge(crate::ai::routes())
+        .merge(crate::mail::routes());
     Router::new()
         .nest("/api", api)
         .fallback(crate::assets::serve)
@@ -85,7 +95,84 @@ async fn meta(State(st): State<Shared>) -> Json<Value> {
         "providers": providers::describe(!s.google_places_key.is_empty(), !s.yandex_geosearch_key.is_empty()),
         "psi": !s.psi_key.is_empty() && s.psi_enabled,
         "browser": scanner_core::render::find_browser(Some(s.browser_path.as_str()).filter(|p| !p.trim().is_empty())).map(|p| p.display().to_string()),
+        // Проблема простыми словами по номеру метрики — заголовки в отчёте для клиента.
+        "labels": catalog()
+            .metrics
+            .iter()
+            .filter_map(|m| scanner_core::mini::label(&m.id).map(|l| (m.id.clone(), l)))
+            .collect::<std::collections::BTreeMap<_, _>>(),
+        // То же в виде «в порядке» — для пройденных пунктов отчёта.
+        "labels_ok": catalog()
+            .metrics
+            .iter()
+            .filter_map(|m| scanner_core::mini::label_ok(&m.id).map(|l| (m.id.clone(), l)))
+            .collect::<std::collections::BTreeMap<_, _>>(),
+        // Английские формулировки — для материалов клиентам из англоязычных стран (`lang: "en"`).
+        "labels_en": catalog()
+            .metrics
+            .iter()
+            .filter_map(|m| scanner_core::mini::label_en(&m.id).map(|l| (m.id.clone(), l)))
+            .collect::<std::collections::BTreeMap<_, _>>(),
+        "labels_ok_en": catalog()
+            .metrics
+            .iter()
+            .filter_map(|m| scanner_core::mini::label_ok_en(&m.id).map(|l| (m.id.clone(), l)))
+            .collect::<std::collections::BTreeMap<_, _>>(),
     }))
+}
+
+/// Адрес самого сервера (для браузера, который печатает отчёт в PDF).
+static SELF_URL: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
+pub fn set_self_url(listen: std::net::SocketAddr) {
+    // Слушает все интерфейсы — к себе ходим через loopback.
+    let ip = if listen.ip().is_unspecified() { std::net::IpAddr::from([127, 0, 0, 1]) } else { listen.ip() };
+    let _ = SELF_URL.set(format!("http://{}", std::net::SocketAddr::new(ip, listen.port())));
+}
+
+/// Имя файла для Content-Disposition: латиница в `filename`, полное — в `filename*` (RFC 5987).
+fn attachment(name: &str, ascii_fallback: &str) -> String {
+    let enc: String = name
+        .bytes()
+        .map(|b| if b.is_ascii_alphanumeric() || b"-._~".contains(&b) { (b as char).to_string() } else { format!("%{b:02X}") })
+        .collect();
+    format!("attachment; filename=\"{ascii_fallback}\"; filename*=UTF-8''{enc}")
+}
+
+/// Страница `/{page}/{id}` приложения в PDF — печатает headless-браузер, без колонтитулов браузера.
+/// PDF страницы сканера (`report`, `proposal`) через headless Chromium. Ошибка — понятным текстом.
+pub(crate) async fn render_pdf(st: &Shared, id: i64, page: &str) -> Result<Vec<u8>, String> {
+    let browser = {
+        let s = st.settings.read().await;
+        scanner_core::render::find_browser(Some(s.browser_path.as_str()).filter(|p| !p.trim().is_empty()))
+    }
+    .ok_or_else(|| "Нет браузера для PDF: поставьте Chromium (pacman -S chromium) или укажите путь в настройках".to_string())?;
+    let base = SELF_URL.get().cloned().unwrap_or_else(|| "http://127.0.0.1:8787".into());
+    scanner_core::render::print_pdf(&browser, &format!("{base}/{page}/{id}"), Duration::from_secs(60)).await.map_err(|e| format!("PDF не собрался: {e}"))
+}
+
+/// Домен сайта компании для имени файла.
+pub(crate) fn file_host(b: &crate::db::BusinessRow) -> Option<String> {
+    b.site.get("final_url").and_then(|v| v.as_str()).or(b.website.as_deref()).and_then(parse_url_lenient).map(|u| host_of(&u)).filter(|h| !h.is_empty())
+}
+
+async fn page_pdf(st: &Shared, id: i64, page: &str, title: &str, ascii_prefix: &str) -> ApiResult<Response> {
+    let b = st.db.get_business(id).await?.ok_or_else(not_found)?;
+    let pdf = render_pdf(st, id, page).await.map_err(|e| if e.starts_with("Нет браузера") { bad(format!("{e}. Пока можно «Печать» → «Сохранить как PDF»")) } else { ApiError(StatusCode::BAD_GATEWAY, e) })?;
+    let host = file_host(&b);
+    let name = format!("{title} {}.pdf", host.clone().unwrap_or_else(|| b.name.clone())).replace(['/', '\\', '"'], " ");
+    let ascii = format!("{ascii_prefix}-{}.pdf", host.filter(|h| h.is_ascii()).unwrap_or_else(|| id.to_string()));
+    Ok(([(header::CONTENT_TYPE, "application/pdf".to_string()), (header::CONTENT_DISPOSITION, attachment(&name, &ascii))], pdf).into_response())
+}
+
+/// Отчёт для клиента в PDF.
+async fn report_pdf(State(st): State<Shared>, Path(id): Path<i64>) -> ApiResult<Response> {
+    page_pdf(&st, id, "report", "Аудит", "audit").await
+}
+
+/// Коммерческое предложение в PDF (страница `/proposal/{id}`).
+async fn proposal_pdf(State(st): State<Shared>, Path(id): Path<i64>) -> ApiResult<Response> {
+    page_pdf(&st, id, "proposal", "КП", "proposal").await
 }
 
 async fn get_settings(State(st): State<Shared>) -> Json<Value> {
@@ -332,10 +419,170 @@ async fn list_businesses(State(st): State<Shared>, Path(id): Path<i64>) -> ApiRe
     Ok(Json(json!(st.db.list_businesses(id, true).await?)))
 }
 
+/// Валюта по умолчанию для лида: по стране скана (BYN, GBP, USD, EUR…), иначе из настроек.
+fn scan_country(scan: Option<&crate::db::ScanRow>) -> Option<String> {
+    scan.and_then(|sc| serde_json::from_value::<ScanParams>(sc.params.clone()).ok()).and_then(|p| p.country)
+}
+
+async fn default_currency(st: &Shared, scan_id: i64) -> String {
+    let country = scan_country(st.db.get_scan(scan_id).await.ok().flatten().as_ref());
+    sales::currency_for_country(country.as_deref(), &st.settings.read().await.currency)
+}
+
+/// Всё о компании для первого сообщения: параметры скана, карточка, результаты проверки, профиль менеджера.
+pub(crate) struct LeadCtx {
+    pub params: Option<ScanParams>,
+    /// Название города — из city_names; «city» часто район («Запад»), поэтому он последним.
+    pub cities: Vec<String>,
+    pub card: Business,
+    pub results: Vec<MetricResult>,
+    pub state: SiteState,
+    /// Домен клиента — из карточки, а не конечный адрес после перенаправления (у мёртвого сайта это страница хостера).
+    pub host: Option<String>,
+    pub name: String,
+    pub category: Option<String>,
+    pub manager: sales::Manager,
+    /// Проверка прошла и мини-отчёт есть — можно писать.
+    pub ready: bool,
+}
+
+impl LeadCtx {
+    pub fn new(b: &crate::db::BusinessRow, scan: Option<&crate::db::ScanRow>, s: &crate::settings::Settings) -> Self {
+        let params: Option<ScanParams> = scan.and_then(|sc| serde_json::from_value(sc.params.clone()).ok());
+        let cities: Vec<String> = params.as_ref().map(|p| p.city_names.iter().chain(p.city.iter()).cloned().collect()).unwrap_or_default();
+        let card: Business = serde_json::from_value(b.data.clone()).unwrap_or_default();
+        let mut results: Vec<MetricResult> = serde_json::from_value(b.results.clone()).unwrap_or_default();
+        fill_maps(&mut results, &card);
+        let mini = &b.report["mini"];
+        let state: SiteState = serde_json::from_value(mini["state"].clone()).unwrap_or_default();
+        let host = sales::client_host(state, b.website.as_deref(), b.site_url.as_deref(), b.site.get("final_url").and_then(|v| v.as_str()));
+        Self {
+            params,
+            cities,
+            card,
+            results,
+            state,
+            host,
+            name: client_name(b),
+            category: b.category.clone(),
+            manager: s.manager(),
+            ready: b.audit_status == "done" && !mini.is_null(),
+        }
+    }
+
+    pub fn country(&self) -> Option<&str> {
+        self.params.as_ref().and_then(|p| p.country.as_deref())
+    }
+
+    pub fn input(&self) -> OutreachInput<'_> {
+        OutreachInput {
+            business: &self.name,
+            category: self.category.as_deref(),
+            preset: self.params.as_ref().and_then(|p| p.preset.as_deref()),
+            country: self.country(),
+            cities: &self.cities,
+            host: self.host.as_deref(),
+            state: self.state,
+            results: &self.results,
+            manager: &self.manager,
+        }
+    }
+}
+
+/// Контакты компании: карточки, сайт (если сайт её и настоящий), добавленные вручную.
+pub(crate) fn lead_contacts(b: &crate::db::BusinessRow, ctx: &LeadCtx) -> Vec<sales::Contact> {
+    // Заглушка, мёртвый, чужой или неподтверждённый сайт: его контакты и соцсети принадлежат хостеру или другой компании.
+    let site: Contacts = if sales::site_contacts_trusted(ctx.state, &ctx.results) { serde_json::from_value(b.site["contacts"].clone()).unwrap_or_default() } else { Contacts::default() };
+    let manual: Vec<ManualContact> = serde_json::from_value(b.extra_contacts.clone()).unwrap_or_default();
+    sales::contact_list(&ctx.card, &site, &manual, ctx.country())
+}
+
+/// Всё, что менеджеру нужно к карточке лида: контакты, собранное КП, первое сообщение и язык материалов (`lang`).
+async fn sales_view(st: &Shared, b: &crate::db::BusinessRow, scan: Option<&crate::db::ScanRow>) -> (Value, Value, Value, &'static str) {
+    let s = st.settings.read().await.clone();
+    let ctx = LeadCtx::new(b, scan, &s);
+    let country = ctx.country();
+    let lang = sales::outreach_lang(country, &ctx.cities);
+    let contacts = lead_contacts(b, &ctx);
+    // Валюта КП: у лида заданная, иначе по стране скана. Цены — из прайса этой валюты (курсом не пересчитываются).
+    let currency = b.deal_currency.clone().filter(|c| !c.is_empty()).unwrap_or_else(|| sales::currency_for_country(country, &s.currency));
+    let (prices, mismatch) = sales::price_list_for(&currency, &s.currency, &s.price_list, &s.price_lists);
+    let mut proposal = json!(sales::build_proposal(&ctx.results, ctx.state, &prices, &SavedProposal::from_value(&b.proposal), lang));
+    proposal["currency"] = json!(currency);
+    // true — для этой валюты своих цен нет, показаны цены из настроек как есть: менеджеру стоит проверить суммы.
+    proposal["prices_unverified"] = json!(mismatch);
+    let outreach = if ctx.ready { sales::outreach(&ctx.input()) } else { None };
+    (json!(contacts), proposal, json!(outreach), lang)
+}
+
+/// Результаты, сохранённые до появления `maps`: карту раздела A берём из источников карточки.
+pub(crate) fn fill_maps(results: &mut [MetricResult], card: &Business) {
+    if let Some(maps) = scanner_core::checks::open_maps_label(card) {
+        for r in results.iter_mut().filter(|r| r.id.starts_with('A') && r.maps.is_none()) {
+            r.maps = Some(maps.clone());
+        }
+    }
+}
+
+/// Название компании для документов клиенту: заданное вручную, иначе из карточки.
+pub(crate) fn client_name(b: &crate::db::BusinessRow) -> String {
+    b.display_name.as_deref().map(str::trim).filter(|n| !n.is_empty()).unwrap_or(&b.name).to_string()
+}
+
+/// Адрес для документов клиенту: заданный вручную, иначе из карточки.
+pub(crate) fn client_address(b: &crate::db::BusinessRow) -> Option<String> {
+    b.display_address.as_deref().map(str::trim).filter(|a| !a.is_empty()).or(b.address.as_deref().map(str::trim).filter(|a| !a.is_empty())).map(str::to_string)
+}
+
 async fn get_business(State(st): State<Shared>, Path(id): Path<i64>) -> ApiResult<Json<Value>> {
     let b = st.db.get_business(id).await?.ok_or_else(not_found)?;
     let scan = st.db.get_scan(b.scan_id).await?;
-    Ok(Json(json!({ "business": b, "scan": scan })))
+    let (contacts, proposal, outreach, lang) = sales_view(&st, &b, scan.as_ref()).await;
+    let activities = st.db.list_activities(id).await?;
+    let messages = st.db.list_messages(id).await?;
+    // Формулировка по фактическому результату (статус и значение), а не общая по метрике: у каждого результата
+    // `plain` (по-русски) и `plain_en`; для пройденных — «в порядке».
+    let mut biz = json!(b);
+    let mut parsed: Vec<MetricResult> = serde_json::from_value(b.results.clone()).unwrap_or_default();
+    fill_maps(&mut parsed, &serde_json::from_value(b.data.clone()).unwrap_or_default());
+    if let Some(arr) = biz["results"].as_array_mut() {
+        for (item, r) in arr.iter_mut().zip(parsed.iter()) {
+            item["plain"] = json!(scanner_core::mini::plain_text_lang(r, "ru"));
+            item["plain_en"] = json!(scanner_core::mini::plain_text_lang(r, "en"));
+        }
+    }
+    let (name, address) = (client_name(&b), client_address(&b));
+    // У заглушки и мёртвого сайта заголовок страницы — хостера, не компании.
+    let no_site = matches!(b.report["mini"]["state"].as_str(), Some("stub" | "dead"));
+    let suggestion = if no_site { None } else { sales::name_suggestion(b.site["site_name"].as_str(), b.site["title"].as_str(), &name, &b.name) };
+    biz["client_name"] = json!(name);
+    biz["client_address"] = json!(address);
+    biz["name_suggestion"] = json!(suggestion);
+    // Контактов нет совсем — менеджеру предупреждение: писать некуда, нужно искать вручную.
+    let has_contacts = contacts.as_array().is_some_and(|a| !a.is_empty());
+    biz["has_contacts"] = json!(has_contacts);
+    // Первый телефон в международном виде — для шапок страницы компании, отчёта и КП.
+    let country = scan.as_ref().and_then(|sc| sc.params["country"].as_str());
+    let phone = contacts.as_array().and_then(|a| a.iter().find(|c| c["kind"] == "phone")).and_then(|c| {
+        let v = c["value"].as_str()?;
+        Some(if c["source"] == "manual" { v.to_string() } else { sales::phone_grouped(v, country) })
+    });
+    biz["client_phone"] = json!(phone);
+    Ok(Json(json!({
+        "has_contacts": has_contacts,
+        "business": biz, "scan": scan, "contacts": contacts, "activities": activities, "proposal": proposal, "outreach": outreach, "lang": lang,
+        "messages": messages,
+        "client_name": name, "client_address": address, "name_suggestion": suggestion,
+    })))
+}
+
+/// Отличить «поля нет» от `null` (очистить).
+fn double_option<'de, D, T>(d: D) -> Result<Option<Option<T>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    Option::<T>::deserialize(d).map(Some)
 }
 
 #[derive(Deserialize)]
@@ -344,6 +591,34 @@ struct BusinessPatch {
     notes: Option<String>,
     /// Сайт компании вручную; "" — убрать.
     website_override: Option<String>,
+    /// Цена сделки; null — убрать.
+    #[serde(default, deserialize_with = "double_option")]
+    deal_price: Option<Option<f64>>,
+    deal_currency: Option<String>,
+    /// YYYY-MM-DD; "" — убрать.
+    next_action_at: Option<String>,
+    next_action: Option<String>,
+    contact_person: Option<String>,
+    /// Название компании для документов клиенту; "" — вернуть название из карточки.
+    display_name: Option<String>,
+    /// Адрес для документов клиенту; "" — вернуть адрес из карточки.
+    display_address: Option<String>,
+    /// [{kind, value, note?}]; null — очистить.
+    #[serde(default, deserialize_with = "double_option")]
+    extra_contacts: Option<Option<Value>>,
+    /// Правки КП; null — сбросить.
+    #[serde(default, deserialize_with = "double_option")]
+    proposal: Option<Option<Value>>,
+}
+
+/// «1200», «1200.5» — цена без лишних нулей.
+fn price_text(x: f64) -> String {
+    if x.fract() == 0.0 { format!("{x:.0}") } else { format!("{x:.2}").trim_end_matches('0').to_string() }
+}
+
+/// Сегодняшняя дата менеджера (по часам машины) плюс дни.
+fn today_plus(days: i64) -> String {
+    (chrono::Local::now().date_naive() + chrono::Duration::days(days)).format("%Y-%m-%d").to_string()
 }
 
 async fn patch_business(State(st): State<Shared>, Path(id): Path<i64>, Json(p): Json<BusinessPatch>) -> ApiResult<Json<Value>> {
@@ -359,16 +634,225 @@ async fn patch_business(State(st): State<Shared>, Path(id): Path<i64>, Json(p): 
         None => None,
     };
     let site_changed = site.as_ref().is_some_and(|w| Some(w.as_str()) != before.website_override.as_deref().or(Some("")));
-    st.db.update_business_meta(id, p.lead_status, p.notes, site).await?;
+    if let Some(Some(x)) = p.deal_price
+        && !(x.is_finite() && x >= 0.0)
+    {
+        return Err(bad("цена должна быть неотрицательным числом"));
+    }
+    if let Some(d) = p.next_action_at.as_deref().map(str::trim).filter(|d| !d.is_empty())
+        && chrono::NaiveDate::parse_from_str(d, "%Y-%m-%d").is_err()
+    {
+        return Err(bad("дата следующего шага — в формате ГГГГ-ММ-ДД"));
+    }
+    let currency = match p.deal_currency.as_deref().map(|c| c.trim().to_uppercase()) {
+        Some(c) if c.is_empty() => Some(String::new()),
+        Some(c) if (3..=5).contains(&c.chars().count()) && c.chars().all(|x| x.is_alphabetic()) => Some(c),
+        Some(_) => return Err(bad("валюта — код вроде BYN, RUB, USD")),
+        None => None,
+    };
+    let extra_contacts = match p.extra_contacts {
+        None => None,
+        Some(None) => Some(Value::Null),
+        Some(Some(v)) => {
+            let list: Vec<ManualContact> = serde_json::from_value(v).map_err(|_| bad("контакты — массив {kind, value, note?}"))?;
+            if list.len() > 50 {
+                return Err(bad("слишком много контактов"));
+            }
+            let clean: Vec<ManualContact> = list
+                .into_iter()
+                .map(|c| ManualContact { kind: c.kind.trim().to_lowercase(), value: c.value.trim().to_string(), note: c.note.map(|n| n.trim().to_string()).filter(|n| !n.is_empty()) })
+                .filter(|c| !c.kind.is_empty() && !c.value.is_empty())
+                .collect();
+            Some(json!(clean))
+        }
+    };
+    let proposal = match p.proposal {
+        None => None,
+        Some(None) => Some(Value::Null),
+        Some(Some(v)) => {
+            if !v.is_object() {
+                return Err(bad("КП — объект {packages, extra, discount, note, valid_days}"));
+            }
+            serde_json::from_value::<SavedProposal>(v.clone()).map_err(|_| bad("неверная форма КП"))?;
+            Some(v)
+        }
+    };
+    let status_changed = p.lead_status.as_deref().filter(|s| *s != before.lead_status);
+    let price_changed = p.deal_price.filter(|x| *x != before.deal_price);
+    let cur_for_text = currency.clone().filter(|c| !c.is_empty()).or(before.deal_currency.clone().filter(|c| !c.is_empty())).unwrap_or_default();
+    let status_text = status_changed.map(|s| format!("Статус: {} → {}", crate::db::status_label(&before.lead_status), crate::db::status_label(s)));
+    let meta = crate::db::MetaPatch {
+        lead_status: p.lead_status,
+        notes: p.notes,
+        website_override: site,
+        deal_price: p.deal_price,
+        deal_currency: currency,
+        next_action_at: p.next_action_at.map(|d| d.trim().to_string()),
+        next_action: p.next_action,
+        contact_person: p.contact_person,
+        extra_contacts,
+        proposal,
+        display_name: p.display_name,
+        display_address: p.display_address,
+    };
+    st.db.update_business_meta(id, meta).await?;
+    if let Some(t) = status_text {
+        st.db.add_activity(id, "status".into(), None, Some(t), None).await?;
+    }
+    if let Some(new) = price_changed {
+        let cur = if cur_for_text.is_empty() { default_currency(&st, before.scan_id).await } else { cur_for_text };
+        let text = match (before.deal_price, new) {
+            (Some(o), Some(n)) => format!("Цена: {} → {} {cur}", price_text(o), price_text(n)),
+            (None, Some(n)) => format!("Цена: {} {cur}", price_text(n)),
+            (_, None) => "Цена сброшена".to_string(),
+        };
+        st.db.add_activity(id, "price".into(), None, Some(text), None).await?;
+    }
     if site_changed {
         spawn_business_audit(st.clone(), id);
     }
     st.emit_business(id).await;
-    Ok(Json(json!({ "business": st.db.business_brief(id).await?, "reaudit": site_changed })))
+    Ok(Json(json!({ "business": st.db.business_brief(id).await?, "reaudit": site_changed, "activities": st.db.list_activities(id).await? })))
+}
+
+#[derive(Deserialize)]
+struct NewActivity {
+    kind: String,
+    channel: Option<String>,
+    text: Option<String>,
+    /// RFC 3339 или ГГГГ-ММ-ДД; по умолчанию — сейчас.
+    at: Option<String>,
+}
+
+fn parse_at(raw: &str) -> Option<String> {
+    let t = raw.trim();
+    let utc = if let Ok(d) = chrono::DateTime::parse_from_rfc3339(t) {
+        d.with_timezone(&chrono::Utc)
+    } else {
+        let d = chrono::NaiveDate::parse_from_str(t, "%Y-%m-%d").ok()?;
+        d.and_hms_opt(12, 0, 0)?.and_utc()
+    };
+    Some(utc.to_rfc3339_opts(chrono::SecondsFormat::Secs, true))
+}
+
+fn clean_channel(c: Option<String>) -> Result<Option<String>, ApiError> {
+    match c.map(|c| c.trim().to_lowercase()).filter(|c| !c.is_empty()) {
+        Some(c) if crate::db::ACTIVITY_CHANNELS.contains(&c.as_str()) => Ok(Some(c)),
+        Some(_) => Err(bad("неизвестный канал")),
+        None => Ok(None),
+    }
+}
+
+async fn add_activity(State(st): State<Shared>, Path(id): Path<i64>, Json(a): Json<NewActivity>) -> ApiResult<Json<Value>> {
+    st.db.business_brief(id).await?.ok_or_else(not_found)?;
+    let kind = a.kind.trim().to_lowercase();
+    if !crate::db::ACTIVITY_KINDS.contains(&kind.as_str()) {
+        return Err(bad("неизвестный вид касания"));
+    }
+    let channel = clean_channel(a.channel)?;
+    let at = match a.at.as_deref().map(str::trim).filter(|x| !x.is_empty()) {
+        Some(x) => Some(parse_at(x).ok_or_else(|| bad("время — в формате RFC 3339 или ГГГГ-ММ-ДД"))?),
+        None => None,
+    };
+    let text = a.text.map(|t| t.trim().to_string()).filter(|t| !t.is_empty());
+    let activity = st.db.add_activity(id, kind, channel, text, at).await?;
+    st.emit_business(id).await;
+    Ok(Json(json!({ "activity": activity, "activities": st.db.list_activities(id).await? })))
+}
+
+async fn delete_activity(State(st): State<Shared>, Path(aid): Path<i64>) -> ApiResult<Json<Value>> {
+    let bid = st.db.delete_activity(aid).await?.ok_or_else(not_found)?;
+    st.emit_business(bid).await;
+    Ok(Json(json!({ "deleted": true, "activities": st.db.list_activities(bid).await? })))
+}
+
+#[derive(Deserialize)]
+struct Sent {
+    channel: Option<String>,
+    text: Option<String>,
+    /// Черновик нейросети, который отправили: сохранить итоговый текст и пометить отправленным.
+    #[serde(default)]
+    message_id: Option<i64>,
+    #[serde(default)]
+    subject: Option<String>,
+    #[serde(default)]
+    body: Option<String>,
+}
+
+/// «Отправили первое сообщение»: касание, статус «новый» → «написали», следующий шаг через 3 дня.
+async fn mark_sent(State(st): State<Shared>, Path(id): Path<i64>, Json(s): Json<Sent>) -> ApiResult<Json<Value>> {
+    let before = st.db.business_brief(id).await?.ok_or_else(not_found)?;
+    let channel = clean_channel(s.channel)?.ok_or_else(|| bad("укажите канал отправки"))?;
+    let text = s.text.map(|t| t.trim().to_string()).filter(|t| !t.is_empty());
+    if let Some(mid) = s.message_id {
+        let m = st.db.get_message(mid).await?.filter(|m| m.business_id == id).ok_or_else(|| bad("черновик не от этой компании"))?;
+        let subject = s.subject.map(|x| x.trim().to_string()).filter(|_| m.kind == "email");
+        st.db.update_message(mid, subject, s.body.map(|x| x.trim().to_string()).filter(|x| !x.is_empty()), Some("sent")).await?;
+    }
+    let activity = record_sent(&st, &before, channel, text).await?;
+    Ok(Json(json!({ "activity": activity, "business": st.db.business_brief(id).await?, "activities": st.db.list_activities(id).await? })))
+}
+
+/// Сообщение отправлено (вручную или рассылкой): касание в журнал, «Новый» → «Написали»,
+/// следующий шаг «Проверить ответ» через 3 дня, если шага ещё нет.
+pub(crate) async fn record_sent(st: &Shared, before: &crate::db::BusinessRow, channel: String, text: Option<String>) -> anyhow::Result<crate::db::Activity> {
+    let id = before.id;
+    let activity = st.db.add_activity(id, "message".into(), Some(channel), text, None).await?;
+    let mut meta = crate::db::MetaPatch::default();
+    let empty = |v: &Option<String>| v.as_deref().is_none_or(|x| x.trim().is_empty());
+    let (no_date, no_step) = (empty(&before.next_action_at), empty(&before.next_action));
+    if no_date {
+        meta.next_action_at = Some(today_plus(3));
+    }
+    if no_date || no_step {
+        meta.next_action = Some("Проверить ответ".into());
+    }
+    if before.lead_status == "new" {
+        meta.lead_status = Some("contacted".into());
+        st.db.add_activity(id, "status".into(), None, Some(format!("Статус: {} → {}", crate::db::status_label("new"), crate::db::status_label("contacted"))), None).await?;
+    }
+    st.db.update_business_meta(id, meta).await?;
+    st.emit_business(id).await;
+    Ok(activity)
 }
 
 async fn list_leads(State(st): State<Shared>) -> ApiResult<Json<Value>> {
     Ok(Json(json!(st.db.list_leads().await?)))
+}
+
+/// Лиды в CSV для Excel: UTF-8 с BOM, разделитель «;».
+async fn leads_csv(State(st): State<Shared>) -> ApiResult<Response> {
+    let rows = st.db.list_leads().await?;
+    let mut scan_cur: std::collections::HashMap<i64, String> = Default::default();
+    let mut out = String::from("\u{feff}Компания;Статус;Следующий шаг (дата);Следующий шаг;Цена;Валюта;Контактное лицо;Телефон;Сайт;Последнее касание;Балл;Заметки;Скан\n");
+    for b in rows {
+        let default_cur = match scan_cur.get(&b.scan_id) {
+            Some(c) => c.clone(),
+            None => {
+                let c = default_currency(&st, b.scan_id).await;
+                scan_cur.insert(b.scan_id, c.clone());
+                c
+            }
+        };
+        let cells = [
+            b.name.clone(),
+            crate::db::status_label(&b.lead_status).to_string(),
+            b.next_action_at.clone().unwrap_or_default(),
+            b.next_action.clone().unwrap_or_default(),
+            b.deal_price.map(|p| price_text(p).replace('.', ",")).unwrap_or_default(),
+            b.deal_price.map(|_| b.deal_currency.clone().filter(|c| !c.is_empty()).unwrap_or_else(|| default_cur.clone())).unwrap_or_default(),
+            b.contact_person.clone().unwrap_or_default(),
+            b.phone.clone().unwrap_or_default(),
+            b.site_url.clone().or(b.website.clone()).unwrap_or_default(),
+            b.last_activity_at.clone().unwrap_or_default(),
+            b.overall.map(|o| o.to_string()).unwrap_or_default(),
+            b.notes.clone().unwrap_or_default().replace('\n', " "),
+            b.scan_name.clone().unwrap_or_default(),
+        ];
+        out.push_str(&cells.iter().map(|c| csv_field(c)).collect::<Vec<_>>().join(";"));
+        out.push('\n');
+    }
+    Ok(([(header::CONTENT_TYPE, "text/csv; charset=utf-8".to_string()), (header::CONTENT_DISPOSITION, "attachment; filename=\"leads.csv\"".to_string())], out).into_response())
 }
 
 async fn audit_business(State(st): State<Shared>, Path(id): Path<i64>) -> ApiResult<Json<Value>> {
@@ -449,6 +933,7 @@ async fn export_csv(State(st): State<Shared>, Path(id): Path<i64>) -> ApiResult<
     let status_label = |s: &str| match s {
         "contacted" => "написали",
         "talking" => "переговоры",
+        "proposal" => "КП отправлено",
         "client" => "клиент",
         "rejected" => "отказ",
         "skip" => "не подходит",
@@ -616,11 +1101,36 @@ mod tests {
         assert_eq!(st, StatusCode::OK);
         assert_eq!(v["catalog"]["metrics"].as_array().unwrap().len(), 214);
         assert_eq!(v["providers"][0]["id"], "osm");
-        let (st, v) = call(app.clone(), "PUT", "/api/settings", Some(json!({"psi_key": "KEY12345"}))).await;
+        let (st, v) = call(app.clone(), "PUT", "/api/settings", Some(json!({"psi_key": "AIzaKEY0012345"}))).await;
         assert_eq!(st, StatusCode::OK);
         assert_eq!(v["psi_key"]["hint"], "••••2345");
         let (_, v) = call(app, "GET", "/api/meta", None).await;
         assert_eq!(v["psi"], true);
+        assert!(v["labels_en"]["B04"].as_str().unwrap().contains("HTTPS"));
+        assert!(v["labels_ok_en"]["B04"].as_str().is_some());
+        assert_eq!(v["labels"].as_object().unwrap().len(), v["labels_en"].as_object().unwrap().len());
+    }
+
+    /// Лондон: язык материалов en, валюта КП GBP по стране скана, прайс GBP, домен клиента из карточки.
+    #[tokio::test]
+    async fn london_lead_gets_english_and_pounds() {
+        let db = crate::db::Db::in_memory().unwrap();
+        let sid = db.insert_scan("London".into(), "map", json!({"center": {"lat": 51.5, "lon": -0.1}, "radius_m": 1000.0, "providers": ["osm"], "query": "", "country": "gb", "city_names": ["City of Westminster", "Westminster"]})).await.unwrap();
+        let b = Business { name: "Mute Publishing Ltd.".into(), phone: Some("020 3287 9005".into()), website: Some("http://www.metamute.org/".into()), ..Default::default() };
+        db.insert_businesses(sid, vec![b]).await.unwrap();
+        let bid = db.scan_businesses(sid, false).await.unwrap()[0].0;
+        let results = json!([{"id": "B04", "status": "fail", "detail": "Сайт работает без HTTPS"}]);
+        let report = json!({"mini": {"state": "weak", "headline": "", "problems": [], "offer": [], "fail_ids": []}});
+        db.save_audit(bid, "warm".into(), Some(25.0), 100.0, report, results, json!({"final_url": "https://www.metamute.org/", "contacts": {"emails": [], "phones": [], "links": []}}), 5, Value::Null, Some("http://www.metamute.org/".into())).await.unwrap();
+        let app = router(crate::jobs::AppState::new(db).await.unwrap());
+        let (_, v) = call(app, "GET", &format!("/api/businesses/{bid}"), None).await;
+        assert_eq!((v["lang"].as_str(), v["proposal"]["lang"].as_str(), v["proposal"]["currency"].as_str()), (Some("en"), Some("en"), Some("GBP")));
+        assert_eq!(v["proposal"]["prices_unverified"], false);
+        assert_eq!(v["contacts"][0]["url"], "tel:+442032879005");
+        let pk = v["proposal"]["packages"].as_array().unwrap().iter().find(|p| p["id"] == "https").unwrap();
+        assert_eq!((pk["price"].as_f64(), pk["title"].as_str()), (Some(35.0), Some("HTTPS and redirects")));
+        let short = v["outreach"]["short"].as_str().unwrap();
+        assert!(short.contains("www.metamute.org") && !short.contains("hoster") && short.starts_with("Hello!"), "{short}");
     }
 
     #[tokio::test]
@@ -631,6 +1141,112 @@ mod tests {
         assert!(v["error"].as_str().unwrap().contains("радиус"));
         let (st, _) = call(app, "POST", "/api/scans", Some(json!({"center": {"lat": 55.7, "lon": 37.6}, "radius_m": 1000.0, "providers": ["google"]}))).await;
         assert_eq!(st, StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn sales_flow() {
+        let db = crate::db::Db::in_memory().unwrap();
+        let sid = db.insert_scan("Тест".into(), "map", json!({"center": {"lat": 1.0, "lon": 1.0}, "radius_m": 1000.0, "providers": ["osm"], "query": "", "preset": "dentist", "country": "by", "city_names": ["Мінск", "Минск"]})).await.unwrap();
+        let b = Business { name: "Белодент".into(), phone: Some("+375 17 345-67-89".into()), website: Some("https://belodent.by".into()), ..Default::default() };
+        db.insert_businesses(sid, vec![b]).await.unwrap();
+        let bid = db.scan_businesses(sid, false).await.unwrap()[0].0;
+        let results = json!([{"id": "B05", "status": "fail", "value": "no_redirect", "detail": ""}, {"id": "G01", "status": "fail", "detail": ""}]);
+        let report = json!({"mini": {"state": "fair", "headline": "", "problems": [], "offer": [], "fail_ids": []}});
+        db.save_audit(bid, "warm".into(), Some(60.0), 100.0, report, results, json!({"final_url": "https://belodent.by/", "contacts": {"emails": ["info@belodent.by"], "phones": [], "links": []}}), 5, Value::Null, Some("https://belodent.by".into())).await.unwrap();
+        let app = router(crate::jobs::AppState::new(db).await.unwrap());
+
+        let (st, v) = call(app.clone(), "GET", &format!("/api/businesses/{bid}"), None).await;
+        assert_eq!(st, StatusCode::OK);
+        assert_eq!(v["contacts"][0]["url"], "tel:+375173456789");
+        assert_eq!(v["contacts"][1]["source"], "site");
+        assert_eq!(v["proposal"]["total"], 180.0);
+        assert_eq!(v["proposal"]["currency"], "BYN", "валюта по стране скана (by)");
+        assert_eq!((v["lang"].as_str(), v["proposal"]["lang"].as_str()), (Some("ru"), Some("ru")));
+        assert!(v["outreach"]["short"].as_str().unwrap().contains("belodent.by нашлось несколько проблем"));
+        assert!(v["outreach"]["short"].as_str().unwrap().contains("«стоматолог Минск»"));
+
+        let (st, v) = call(app.clone(), "PATCH", &format!("/api/businesses/{bid}"), Some(json!({"lead_status": "talking", "deal_price": 250, "deal_currency": "usd", "next_action_at": "2026-12-01", "next_action": "Позвонить"}))).await;
+        assert_eq!(st, StatusCode::OK);
+        assert_eq!(v["business"]["deal_currency"], "USD");
+        let texts: Vec<&str> = v["activities"].as_array().unwrap().iter().filter_map(|a| a["text"].as_str()).collect();
+        assert!(texts.contains(&"Статус: Новый → Переговоры") && texts.contains(&"Цена: 250 USD"), "{texts:?}");
+        let (st, _) = call(app.clone(), "PATCH", &format!("/api/businesses/{bid}"), Some(json!({"next_action_at": "завтра"}))).await;
+        assert_eq!(st, StatusCode::BAD_REQUEST);
+        let (_, v) = call(app.clone(), "PATCH", &format!("/api/businesses/{bid}"), Some(json!({"deal_price": null, "proposal": {"discount": 10}}))).await;
+        assert!(v["business"]["deal_price"].is_null());
+        let (_, v) = call(app.clone(), "GET", &format!("/api/businesses/{bid}"), None).await;
+        // Валюта лида теперь USD: КП берёт прайс USD (ориентиры, без пересчёта курсом): https 45 + разметка 75 − скидка 10.
+        assert_eq!((v["proposal"]["currency"].as_str(), v["proposal"]["total"].as_f64()), (Some("USD"), Some(110.0)));
+
+        let (st, v) = call(app.clone(), "POST", &format!("/api/businesses/{bid}/activities"), Some(json!({"kind": "call", "channel": "phone", "text": "ответили"}))).await;
+        assert_eq!(st, StatusCode::OK);
+        let aid = v["activity"]["id"].as_i64().unwrap();
+        let (st, _) = call(app.clone(), "POST", &format!("/api/businesses/{bid}/activities"), Some(json!({"kind": "status"}))).await;
+        assert_eq!(st, StatusCode::BAD_REQUEST);
+
+        // «Отправили»: статус не «новый» не трогаем, дата уже есть.
+        let (_, v) = call(app.clone(), "POST", &format!("/api/businesses/{bid}/sent"), Some(json!({"channel": "telegram"}))).await;
+        assert_eq!(v["business"]["lead_status"], "talking");
+        assert_eq!(v["business"]["next_action_at"], "2026-12-01");
+        let (st, _) = call(app.clone(), "POST", &format!("/api/businesses/{bid}/sent"), Some(json!({}))).await;
+        assert_eq!(st, StatusCode::BAD_REQUEST);
+
+        let (_, v) = call(app.clone(), "GET", "/api/leads", None).await;
+        assert_eq!(v[0]["next_action"], "Позвонить");
+        assert!(v[0]["last_activity_at"].is_string());
+        let (st, v) = call(app.clone(), "DELETE", &format!("/api/activities/{aid}"), None).await;
+        assert_eq!((st, v["deleted"].clone()), (StatusCode::OK, json!(true)));
+        let (st, _) = call(app, "DELETE", &format!("/api/activities/{aid}"), None).await;
+        assert_eq!(st, StatusCode::NOT_FOUND);
+    }
+
+    /// Круг 6: `plain`/`plain_en` по факту, ручные название и адрес, подсказка названия, контакты заглушки не берутся.
+    #[tokio::test]
+    async fn client_texts_plain_results_and_untrusted_contacts() {
+        let db = crate::db::Db::in_memory().unwrap();
+        let sid = db.insert_scan("Тест".into(), "map", json!({"center": {"lat": 1.0, "lon": 1.0}, "radius_m": 1000.0, "providers": ["osm"], "query": "", "preset": "dentist", "country": "by", "city_names": ["Минск"]})).await.unwrap();
+        let b = Business { name: "Любімы стаматолаг".into(), address: Some("praspiekt Dziaržynskaha 78".into()), website: Some("https://lubimyj.by".into()), ..Default::default() };
+        db.insert_businesses(sid, vec![b]).await.unwrap();
+        let bid = db.scan_businesses(sid, false).await.unwrap()[0].0;
+        let results = json!([
+            {"id": "G02", "status": "fail", "detail": "Разметки LocalBusiness нет"},
+            {"id": "B01", "status": "pass", "detail": "200 за 400 мс"},
+            {"id": "H02", "status": "fail", "value": "foreign", "detail": "чужой сайт"},
+            {"id": "I06", "status": "fail", "value": 0.2, "detail": "Без выполнения скриптов видна только часть текста: 155 слов из 700 — остальное ИИ-боты не прочитают"}
+        ]);
+        let report = json!({"mini": {"state": "fair", "headline": "Сайт средний: 60/100", "problems": [], "offer": [], "fail_ids": []}});
+        let site = json!({"final_url": "https://lubimyj.by/", "title": "Любимый стоматолог — клиника", "site_name": "Любимый стоматолог", "contacts": {"emails": [], "phones": [], "links": [{"kind": "facebook", "url": "https://www.facebook.com/hover"}]}});
+        db.save_audit(bid, "hot".into(), Some(20.0), 100.0, report, results, site, 5, Value::Null, Some("https://lubimyj.by".into())).await.unwrap();
+        let app = router(crate::jobs::AppState::new(db).await.unwrap());
+
+        let (_, v) = call(app.clone(), "GET", &format!("/api/businesses/{bid}"), None).await;
+        let res = v["business"]["results"].as_array().unwrap();
+        let by = |id: &str| res.iter().find(|r| r["id"] == id).unwrap().clone();
+        assert!(by("G02")["plain"].as_str().unwrap().starts_with("В разметке сайта нет данных о компании"));
+        assert_eq!(by("B01")["plain"], "Главная страница открывается без ошибок");
+        assert_eq!(by("B01")["plain_en"], "The home page opens without errors");
+        assert_eq!(by("I06")["plain"], "Без выполнения скриптов видна только часть текста (155 из 700 слов)");
+        assert!(v["contacts"].as_array().unwrap().iter().all(|c| c["source"] != "site"), "соцсети хостера с заглушки не контакты: {}", v["contacts"]);
+        assert_eq!((v["client_name"].as_str(), v["client_address"].as_str()), (Some("Любімы стаматолаг"), Some("praspiekt Dziaržynskaha 78")));
+        assert_eq!(v["name_suggestion"], "Любимый стоматолог");
+        assert_eq!(v["has_contacts"], false, "контактов нет — менеджеру предупреждение");
+
+        let (_, v) = call(app.clone(), "PATCH", &format!("/api/businesses/{bid}"), Some(json!({"display_name": "Любимый стоматолог", "display_address": "проспект Дзержинского, 78"}))).await;
+        assert_eq!((v["business"]["display_name"].as_str(), v["business"]["display_address"].as_str()), (Some("Любимый стоматолог"), Some("проспект Дзержинского, 78")));
+        let (_, v) = call(app.clone(), "GET", &format!("/api/businesses/{bid}"), None).await;
+        assert_eq!((v["client_name"].as_str(), v["client_address"].as_str()), (Some("Любимый стоматолог"), Some("проспект Дзержинского, 78")));
+        assert!(v["name_suggestion"].is_null(), "задано вручную — подсказки нет");
+        call(app.clone(), "PATCH", &format!("/api/businesses/{bid}"), Some(json!({"lead_status": "contacted"}))).await;
+        let (_, v) = call(app.clone(), "GET", "/api/leads", None).await;
+        assert_eq!(v[0]["has_contacts"], false, "в «Лидах» компания без контактов помечена");
+        call(app.clone(), "PATCH", &format!("/api/businesses/{bid}"), Some(json!({"extra_contacts": [{"kind": "email", "value": "a@lubimyj.by"}]}))).await;
+        let (_, v) = call(app.clone(), "GET", "/api/leads", None).await;
+        assert_eq!(v[0]["has_contacts"], true);
+        let (_, v) = call(app.clone(), "GET", &format!("/api/businesses/{bid}"), None).await;
+        assert_eq!(v["has_contacts"], true);
+        // Список компаний скана: те же контакты и значки каналов, что в «Лидах».
+        let (_, v) = call(app, "GET", &format!("/api/scans/{sid}/businesses"), None).await;
+        assert_eq!((v[0]["has_contacts"].clone(), v[0]["contact_kinds"].clone()), (json!(true), json!(["email"])));
     }
 
     #[test]

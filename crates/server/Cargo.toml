@@ -28,6 +28,11 @@ rusqlite = { version = "0.43", features = ["bundled"] }
 rust-embed = "8"
 mime_guess = "2"
 clap = { version = "4", features = ["derive"] }
+# Рассылка по почте: SMTP с TLS на rustls/ring (как остальной TLS в проекте), без native-tls.
+lettre = { version = "0.11", default-features = false, features = ["smtp-transport", "builder", "hostname", "tokio1-rustls-tls"] }
+jiff = "0.2"
+ring = "0.17"
+base64 = "0.22"
 
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }

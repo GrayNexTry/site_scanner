@@ -42,6 +42,79 @@ pub struct Settings {
     /// Сайты — напрямую через Wi-Fi/Ethernet, мимо VPN-туннеля (быстрее, без гео-блоков для сайтов
     /// своей страны); не открылся напрямую — повтор через VPN. Без VPN ничего не меняет.
     pub direct_network: bool,
+    /// Профиль менеджера: подпись и первое сообщение клиенту.
+    pub manager_name: String,
+    pub manager_email: String,
+    pub manager_phone: String,
+    pub manager_telegram: String,
+    pub company_name: String,
+    /// Своя первая фраза; пусто — по категории («Я делаю сайты и SEO для клиник»).
+    pub intro: String,
+    /// Ссылка на примеры работ: в подписи письма и для нейросети.
+    pub portfolio_url: String,
+    /// Пара фраз о себе для нейросети: опыт, с кем работаете, примеры.
+    pub about_me: String,
+    /// Валюта цен по умолчанию: BYN, RUB, USD, EUR, GBP, PLN…
+    pub currency: String,
+    /// Прайс на пакеты работ (КП): `{id, title, price, enabled}`.
+    pub price_list: Vec<scanner_core::sales::PriceItem>,
+    /// Отдельные прайсы для других валют КП: `{"GBP": [{id, title, price, enabled}, …]}`. Курсом цены не пересчитываются;
+    /// для валюты без записи здесь используются встроенные ориентиры GBP/USD/EUR (их стоит поправить под себя).
+    pub price_lists: std::collections::BTreeMap<String, Vec<scanner_core::sales::PriceItem>>,
+    /// Ключ OpenRouter (секрет): нейросеть для писем клиентам.
+    pub openrouter_key: String,
+    /// Профили нейросети: модель, инструкция, шаблоны запроса, рассуждение и все параметры генерации.
+    pub ai_profiles: Vec<scanner_core::llm::AiProfile>,
+    /// Профиль по умолчанию (id).
+    pub ai_profile: String,
+    /// Сколько писем составлять одновременно при массовой генерации (у бесплатных моделей — 20 запросов в минуту).
+    pub ai_concurrency: usize,
+    /// Почта для рассылки (SMTP).
+    pub smtp_host: String,
+    pub smtp_port: u16,
+    /// `ssl` — сразу TLS (порт 465), `starttls` — порт 587.
+    pub smtp_security: String,
+    pub smtp_user: String,
+    /// Пароль приложения (секрет).
+    pub smtp_password: String,
+    /// Как входить в почту: `password` — логин и пароль приложения, `oauth` — вход через аккаунт
+    /// (Google, Яндекс, Microsoft) без пароля в программе.
+    pub smtp_auth: String,
+    /// Свои приложения OAuth — их регистрирует владелец ящика (бесплатно, один раз): Client ID и Client secret.
+    pub oauth_google_id: String,
+    pub oauth_google_secret: String,
+    pub oauth_yandex_id: String,
+    pub oauth_yandex_secret: String,
+    pub oauth_microsoft_id: String,
+    /// Подключённый вход через аккаунт: сервис (`google`, `yandex`, `microsoft`) и адрес ящика.
+    pub oauth_provider: String,
+    pub oauth_email: String,
+    /// Токены входа (секрет, наружу не отдаются): долгий — для обновления, короткий — для отправки.
+    pub oauth_refresh_token: String,
+    pub oauth_access_token: String,
+    /// Когда истекает короткий токен, Unix-время в секундах.
+    pub oauth_expires_at: i64,
+    pub mail_from_name: String,
+    /// Адрес отправителя; пусто — логин SMTP.
+    pub mail_from_email: String,
+    /// Куда отвечать, если не на адрес отправителя.
+    pub mail_reply_to: String,
+    /// Пауза между письмами: случайная, от и до (секунды).
+    pub mail_interval_min: u64,
+    pub mail_interval_max: u64,
+    /// Писем в день, не больше (новому ящику — 20–30, иначе письма уходят в спам).
+    pub mail_daily_limit: u32,
+    /// Рабочее время по местному времени получателя (часовой пояс — по городу скана): с какого часа и до какого.
+    /// Только днём (6–22) и только по будням — круглосуточной рассылки и выходных нет.
+    pub mail_window_start: u32,
+    pub mail_window_end: u32,
+    /// Прикладывать PDF-разбор сайта (кроме компаний без сайта).
+    pub mail_attach_report: bool,
+    /// Строка в конце письма — как отказаться от писем (по-русски и по-английски).
+    pub mail_footer: String,
+    pub mail_footer_en: String,
+    /// Рассылка запущена (переживает перезапуск сервера).
+    pub mail_running: bool,
 }
 
 impl Default for Settings {
@@ -68,18 +141,87 @@ impl Default for Settings {
             proxy_url: String::new(),
             proxy_always: false,
             direct_network: true,
+            manager_name: String::new(),
+            manager_email: String::new(),
+            manager_phone: String::new(),
+            manager_telegram: String::new(),
+            company_name: String::new(),
+            intro: String::new(),
+            portfolio_url: String::new(),
+            about_me: String::new(),
+            currency: "BYN".into(),
+            price_list: scanner_core::sales::default_price_list(),
+            price_lists: Default::default(),
+            openrouter_key: String::new(),
+            ai_profiles: vec![scanner_core::llm::AiProfile::default()],
+            ai_profile: "default".into(),
+            ai_concurrency: 2,
+            smtp_host: String::new(),
+            smtp_port: 465,
+            smtp_security: "ssl".into(),
+            smtp_user: String::new(),
+            smtp_password: String::new(),
+            smtp_auth: "password".into(),
+            oauth_google_id: String::new(),
+            oauth_google_secret: String::new(),
+            oauth_yandex_id: String::new(),
+            oauth_yandex_secret: String::new(),
+            oauth_microsoft_id: String::new(),
+            oauth_provider: String::new(),
+            oauth_email: String::new(),
+            oauth_refresh_token: String::new(),
+            oauth_access_token: String::new(),
+            oauth_expires_at: 0,
+            mail_from_name: String::new(),
+            mail_from_email: String::new(),
+            mail_reply_to: String::new(),
+            mail_interval_min: 120,
+            mail_interval_max: 300,
+            mail_daily_limit: 25,
+            mail_window_start: 9,
+            mail_window_end: 18,
+            mail_attach_report: true,
+            mail_footer: "Если это неактуально, просто ответьте «нет» — больше писать не буду.".into(),
+            mail_footer_en: "If this isn't relevant, just reply \"no\" and I won't write again.".into(),
+            mail_running: false,
         }
     }
 }
 
-const KEY_FIELDS: &[&str] = &["google_places_key", "yandex_geosearch_key", "psi_key", "safe_browsing_key", "brave_search_key", "yandex_search_key", "proxy_url"];
+const KEY_FIELDS: &[&str] = &[
+    "google_places_key", "yandex_geosearch_key", "psi_key", "safe_browsing_key", "brave_search_key", "yandex_search_key", "proxy_url", "openrouter_key",
+    "smtp_password", "oauth_google_secret", "oauth_yandex_secret",
+];
 
+/// Токены входа в почту: в интерфейс не отдаются вовсе (только «подключено» и адрес).
+const HIDDEN_FIELDS: &[&str] = &["oauth_refresh_token", "oauth_access_token", "oauth_expires_at"];
+
+/// Границы «днём»: раньше 6 и позже 22 письма не уходят.
+const DAY_START: u32 = 6;
+const DAY_END: u32 = 22;
+
+/// Маска секрета: последние 4 символа — только у длинных значений (ключи API); короткий пароль не показываем совсем.
 fn mask(k: &str) -> Value {
-    let tail: String = k.chars().rev().take(4).collect::<Vec<_>>().into_iter().rev().collect();
+    let n = k.chars().count();
+    let tail: String = if n >= 12 { k.chars().skip(n - 4).collect() } else { String::new() };
     json!({ "set": !k.is_empty(), "hint": if k.is_empty() { String::new() } else { format!("••••{tail}") } })
 }
 
 impl Settings {
+    /// Профиль менеджера для подписи и первого сообщения.
+    pub fn manager(&self) -> scanner_core::sales::Manager {
+        scanner_core::sales::Manager {
+            name: self.manager_name.clone(),
+            email: self.manager_email.clone(),
+            phone: self.manager_phone.clone(),
+            telegram: self.manager_telegram.clone(),
+            company: self.company_name.clone(),
+            intro: self.intro.clone(),
+            portfolio: self.portfolio_url.clone(),
+            about: self.about_me.clone(),
+        }
+    }
+
     /// Настройки загрузчика: таймаут и свой прокси.
     pub fn fetch_config(&self) -> scanner_core::http::FetchConfig {
         scanner_core::http::FetchConfig {
@@ -99,6 +241,46 @@ impl Settings {
         scanner_core::render::find_browser(Some(self.browser_path.as_str()).filter(|p| !p.trim().is_empty()))
     }
 
+    /// Профиль нейросети: по id, иначе профиль по умолчанию, иначе первый.
+    pub fn ai_profile(&self, id: Option<&str>) -> scanner_core::llm::AiProfile {
+        let want = id.map(str::trim).filter(|s| !s.is_empty()).unwrap_or(&self.ai_profile);
+        self.ai_profiles
+            .iter()
+            .find(|p| p.id == want)
+            .or_else(|| self.ai_profiles.iter().find(|p| p.id == self.ai_profile))
+            .or(self.ai_profiles.first())
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    /// Почта для рассылки заполнена: сервер, логин, пароль (или вход через аккаунт) и адрес отправителя.
+    pub fn mail_configured(&self) -> bool {
+        let auth = if self.oauth() { self.oauth_connected() } else { !self.smtp_password.is_empty() };
+        !self.smtp_host.trim().is_empty() && !self.smtp_user.trim().is_empty() && auth && self.mail_from().contains('@')
+    }
+
+    /// Вход через аккаунт, а не пароль приложения.
+    pub fn oauth(&self) -> bool {
+        self.smtp_auth == "oauth"
+    }
+
+    pub fn oauth_connected(&self) -> bool {
+        !self.oauth_provider.is_empty() && !self.oauth_refresh_token.is_empty()
+    }
+
+    /// Рабочее время отправки (с, до) — всегда днём; старые значения вне границ (в том числе «круглые сутки»)
+    /// превращаются в 9–18.
+    pub fn mail_window(&self) -> (u32, u32) {
+        let (a, b) = (self.mail_window_start, self.mail_window_end);
+        if a >= DAY_START && b <= DAY_END && b > a { (a, b) } else { (9, 18) }
+    }
+
+    /// Адрес отправителя: заданный или логин SMTP.
+    pub fn mail_from(&self) -> String {
+        let f = self.mail_from_email.trim();
+        if f.is_empty() { self.smtp_user.trim().to_string() } else { f.to_string() }
+    }
+
     pub fn search_config(&self) -> scanner_core::search::SearchConfig {
         let opt = |s: &str| (!s.is_empty()).then(|| s.to_string());
         scanner_core::search::SearchConfig {
@@ -109,12 +291,21 @@ impl Settings {
         }
     }
 
-    /// Для интерфейса: ключи — только «задан/нет» и последние 4 символа.
+    /// Для интерфейса: ключи — только «задан/нет» и последние 4 символа; токены входа — не отдаются.
     pub fn public(&self) -> Value {
         let mut v = serde_json::to_value(self).unwrap_or_default();
         for f in KEY_FIELDS {
             let k = v[f].as_str().unwrap_or("").to_string();
             v[f] = mask(&k);
+        }
+        if let Some(o) = v.as_object_mut() {
+            for f in HIDDEN_FIELDS {
+                o.remove(*f);
+            }
+            o.insert("oauth_connected".into(), json!(self.oauth_connected()));
+            let (a, b) = self.mail_window();
+            o.insert("mail_window_start".into(), json!(a));
+            o.insert("mail_window_end".into(), json!(b));
         }
         v
     }
@@ -135,6 +326,63 @@ impl Settings {
         key("yandex_folder_id", &mut self.yandex_folder_id);
         key("browser_path", &mut self.browser_path);
         key("proxy_url", &mut self.proxy_url);
+        key("manager_name", &mut self.manager_name);
+        key("manager_email", &mut self.manager_email);
+        key("manager_phone", &mut self.manager_phone);
+        key("manager_telegram", &mut self.manager_telegram);
+        key("company_name", &mut self.company_name);
+        key("intro", &mut self.intro);
+        key("openrouter_key", &mut self.openrouter_key);
+        key("portfolio_url", &mut self.portfolio_url);
+        key("about_me", &mut self.about_me);
+        key("smtp_host", &mut self.smtp_host);
+        key("smtp_user", &mut self.smtp_user);
+        key("smtp_password", &mut self.smtp_password);
+        key("oauth_google_id", &mut self.oauth_google_id);
+        key("oauth_google_secret", &mut self.oauth_google_secret);
+        key("oauth_yandex_id", &mut self.oauth_yandex_id);
+        key("oauth_yandex_secret", &mut self.oauth_yandex_secret);
+        key("oauth_microsoft_id", &mut self.oauth_microsoft_id);
+        // Токены входа приходят только из окна входа сервиса (oauth.rs), не из формы настроек.
+        if let Some(a) = patch.get("smtp_auth").and_then(Value::as_str).filter(|v| ["password", "oauth"].contains(v)) {
+            self.smtp_auth = a.to_string();
+        }
+        key("mail_from_name", &mut self.mail_from_name);
+        key("mail_from_email", &mut self.mail_from_email);
+        key("mail_reply_to", &mut self.mail_reply_to);
+        key("mail_footer", &mut self.mail_footer);
+        key("mail_footer_en", &mut self.mail_footer_en);
+        // «plain» (без шифрования) — только для почтового сервера на этом компьютере.
+        let local = matches!(self.smtp_host.trim(), "localhost" | "127.0.0.1" | "::1");
+        if let Some(sec) = patch.get("smtp_security").and_then(Value::as_str).filter(|v| ["ssl", "starttls"].contains(v) || (*v == "plain" && local)) {
+            self.smtp_security = sec.to_string();
+        }
+        if let Some(list) = patch.get("ai_profiles").and_then(|v| serde_json::from_value::<Vec<scanner_core::llm::AiProfile>>(v.clone()).ok()) {
+            self.ai_profiles = scanner_core::llm::normalize_profiles(&list);
+        }
+        if let Some(id) = patch.get("ai_profile").and_then(Value::as_str) {
+            self.ai_profile = id.trim().to_string();
+        }
+        // Профиль по умолчанию — из списка; удалили — первый.
+        if !self.ai_profiles.iter().any(|p| p.id == self.ai_profile) {
+            self.ai_profile = self.ai_profiles.first().map(|p| p.id.clone()).unwrap_or_default();
+        }
+        if let Some(c) = patch.get("currency").and_then(Value::as_str) {
+            let c = c.trim().to_uppercase();
+            if (3..=5).contains(&c.chars().count()) && c.chars().all(|x| x.is_alphabetic()) {
+                self.currency = c;
+            }
+        }
+        if let Some(items) = patch.get("price_list").and_then(|v| serde_json::from_value::<Vec<scanner_core::sales::PriceItem>>(v.clone()).ok()) {
+            self.price_list = scanner_core::sales::normalize_price_list(&items);
+        }
+        if let Some(map) = patch.get("price_lists").and_then(|v| serde_json::from_value::<std::collections::BTreeMap<String, Vec<scanner_core::sales::PriceItem>>>(v.clone()).ok()) {
+            self.price_lists = map
+                .into_iter()
+                .map(|(k, v)| (k.trim().to_uppercase(), scanner_core::sales::normalize_price_list(&v)))
+                .filter(|(k, _)| (3..=5).contains(&k.chars().count()))
+                .collect();
+        }
         let num = |name: &str, lo: u64, hi: u64| patch.get(name).and_then(Value::as_u64).map(|x| x.clamp(lo, hi));
         if let Some(x) = num("max_pages", 1, 200) {
             self.max_pages = x as usize;
@@ -151,6 +399,32 @@ impl Settings {
         if let Some(x) = num("timeout_secs", 5, 60) {
             self.timeout_secs = x;
         }
+        if let Some(x) = num("ai_concurrency", 1, 8) {
+            self.ai_concurrency = x as usize;
+        }
+        if let Some(x) = num("smtp_port", 1, 65535) {
+            self.smtp_port = x as u16;
+        }
+        if let Some(x) = num("mail_interval_min", 10, 86_400) {
+            self.mail_interval_min = x;
+        }
+        if let Some(x) = num("mail_interval_max", 10, 86_400) {
+            self.mail_interval_max = x;
+        }
+        self.mail_interval_max = self.mail_interval_max.max(self.mail_interval_min);
+        if let Some(x) = num("mail_daily_limit", 1, 2000) {
+            self.mail_daily_limit = x as u32;
+        }
+        if let Some(x) = num("mail_window_start", DAY_START as u64, DAY_END as u64 - 1) {
+            self.mail_window_start = x as u32;
+        }
+        if let Some(x) = num("mail_window_end", DAY_START as u64 + 1, DAY_END as u64) {
+            self.mail_window_end = x as u32;
+        }
+        // Конец раньше начала — окно в один час, а не «круглые сутки».
+        let (a, b) = (self.mail_window_start.clamp(DAY_START, DAY_END - 1), self.mail_window_end);
+        self.mail_window_start = a;
+        self.mail_window_end = if b > a && b <= DAY_END { b } else { a + 1 };
         let flag = |name: &str, target: &mut bool| {
             if let Some(b) = patch.get(name).and_then(Value::as_bool) {
                 *target = b;
@@ -162,6 +436,7 @@ impl Settings {
         flag("search_free", &mut self.search_free);
         flag("render_js", &mut self.render_js);
         flag("proxy_always", &mut self.proxy_always);
+        flag("mail_attach_report", &mut self.mail_attach_report);
     }
 }
 
@@ -184,7 +459,60 @@ mod tests {
         s.apply(&json!({"google_places_key": ""}));
         assert!(s.google_places_key.is_empty());
         s.apply(&json!({"proxy_url": "socks5h://user:pass@10.0.0.2:1080"}));
-        assert!(!s.public().to_string().contains("pass"), "пароль прокси наружу не отдаём");
+        assert!(!s.public().to_string().contains("user:pass@"), "пароль прокси наружу не отдаём");
         assert!(s.fetch_config().proxy.is_some());
+        // Профиль менеджера и прайс: прайс дополняется умолчаниями, валюта — трёхбуквенный код.
+        assert_eq!((s.manager_email.as_str(), s.currency.as_str(), s.price_list.len()), ("", "BYN", 15));
+        s.apply(&json!({"manager_name": " Никита ", "currency": "usd", "price_list": [{"id": "https", "title": "", "price": 99, "enabled": false}]}));
+        assert_eq!((s.manager_name.as_str(), s.currency.as_str(), s.price_list.len()), ("Никита", "USD", 15));
+        assert_eq!(s.price_list.iter().find(|p| p.id == "https").map(|p| (p.price, p.enabled)), Some((99.0, false)));
+        s.apply(&json!({"currency": "доллар!", "price_list": "мусор"}));
+        assert_eq!((s.currency.as_str(), s.price_list.len()), ("USD", 15));
+
+        // Нейросеть: ключ — секрет, профили нормализуются, профиль по умолчанию — из списка.
+        s.apply(&json!({"openrouter_key": "sk-or-v1-SECRETabcd"}));
+        assert!(!s.public().to_string().contains("SECRET"));
+        assert_eq!(s.public()["openrouter_key"]["hint"], "••••abcd");
+        assert_eq!((s.ai_profiles.len(), s.ai_profile.as_str()), (1, "default"));
+        s.apply(&json!({"ai_profiles": [{"id": "fast", "name": "Быстрый", "model": "x/y"}, {"id": "fast", "name": "Копия"}], "ai_profile": "nope", "ai_concurrency": 99}));
+        assert_eq!(s.ai_profiles.iter().map(|p| p.id.as_str()).collect::<Vec<_>>(), vec!["fast", "fast-2"]);
+        assert_eq!((s.ai_profile.as_str(), s.ai_concurrency), ("fast", 8), "неизвестный профиль → первый; параллельность ограничена");
+        assert_eq!(s.ai_profile(Some("fast-2")).name, "Копия");
+        assert_eq!(s.ai_profile(Some("нет такого")).id, "fast");
+        assert_eq!(s.ai_profiles[0].system, scanner_core::llm::DEFAULT_SYSTEM, "поля, которых нет в патче, — по умолчанию");
+        // Почта: пароль — секрет, интервалы и окно ограничены, адрес отправителя по умолчанию — логин.
+        s.apply(&json!({"smtp_host": "smtp.gmail.com", "smtp_user": "me@example.com", "smtp_password": "app-pass-SECRET", "smtp_security": "tls?", "mail_interval_min": 5, "mail_interval_max": 1, "mail_window_end": 30}));
+        assert!(!s.public().to_string().contains("SECRET"));
+        s.apply(&json!({"smtp_password": "pw12"}));
+        assert_eq!(s.public()["smtp_password"]["hint"], "••••", "короткий пароль не показываем даже частично");
+        s.apply(&json!({"smtp_password": "app-pass-SECRET"}));
+        assert!(s.mail_configured() && s.mail_from() == "me@example.com");
+        assert_eq!((s.smtp_security.as_str(), s.mail_interval_min, s.mail_interval_max, s.mail_window_end), ("ssl", 10, 10, 22));
+        // Окно — только днём: «круглые сутки» и ночь не сохраняются.
+        s.apply(&json!({"mail_window_start": 0, "mail_window_end": 24}));
+        assert_eq!((s.mail_window_start, s.mail_window_end), (6, 22));
+        s.apply(&json!({"mail_window_start": 15, "mail_window_end": 9}));
+        assert_eq!(s.mail_window(), (15, 16));
+        let legacy = Settings { mail_window_start: 9, mail_window_end: 0, ..Default::default() };
+        assert_eq!(legacy.mail_window(), (9, 18), "старое «круглые сутки» → 9–18");
+        // Вход через аккаунт: секрет приложения маскируется, токены наружу не отдаются и формой не меняются.
+        s.apply(&json!({"smtp_auth": "oauth", "oauth_google_id": "123.apps.googleusercontent.com", "oauth_google_secret": "GOCSPX-SECRETsecret", "oauth_refresh_token": "1//hack"}));
+        assert!(s.oauth() && !s.oauth_connected() && !s.mail_configured(), "без входа почта не настроена");
+        s.oauth_provider = "google".into();
+        s.oauth_refresh_token = "1//REFRESHsecret".into();
+        s.oauth_access_token = "ya29.ACCESSsecret".into();
+        assert!(s.mail_configured());
+        let p = s.public();
+        for secret in ["GOCSPX-SECRET", "REFRESHsecret", "ACCESSsecret"] {
+            assert!(!p.to_string().contains(secret), "{secret}: {p}");
+        }
+        assert!(p.get("oauth_refresh_token").is_none() && p.get("oauth_access_token").is_none());
+        assert_eq!(p["oauth_connected"], true);
+        assert_eq!(p["oauth_google_id"], "123.apps.googleusercontent.com");
+        s.apply(&json!({"smtp_auth": "magic"}));
+        assert_eq!(s.smtp_auth, "oauth");
+        assert!(!s.mail_running, "рассылка включается только кнопкой");
+        s.apply(&json!({"ai_profiles": []}));
+        assert_eq!((s.ai_profiles.len(), s.ai_profile.as_str()), (1, "default"), "пустой список → профиль по умолчанию");
     }
 }

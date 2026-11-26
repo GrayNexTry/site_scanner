@@ -18,7 +18,7 @@ pub fn price_re() -> &'static Regex {
     static R: OnceLock<Regex> = OnceLock::new();
     re(
         &R,
-        r"(?i)(?:\d[\d\s\u{a0}.,]{0,9}\s?(?:₽|руб\b|руб\.|рубл\w*|р\.|€|eur\b|euros?\b|£|\$|usd\b|dollars?\b|chf\b|zł|pln\b|kč|czk\b|kr\b|sek\b|nok\b|dkk\b|₴|грн|₸|lei\b|ft\b|₺|tl\b|byn\b|br\b|бел\.?\s?руб|тенге|тг\b|kzt\b|rub\b|uah\b)|(?:€|£|\$|chf\s?|us\$|fr\.\s?)\s?\d)",
+        r"(?i)(?:\d[\d\s\u{a0}.,]{0,9}\s?(?:₽|руб\b|руб\.|рубл\w*|р\.|р\b|€|eur\b|euros?\b|£|\$|usd\b|dollars?\b|chf\b|zł|pln\b|kč|czk\b|kr\b|sek\b|nok\b|dkk\b|₴|грн|₸|lei\b|ft\b|₺|tl\b|byn\b|br\b|бел\.?\s?руб|тенге|тг\b|kzt\b|rub\b|uah\b)|(?:€|£|\$|chf\s?|us\$|fr\.\s?)\s?\d)",
     )
 }
 
@@ -27,7 +27,7 @@ pub fn address_re() -> &'static Regex {
     static R: OnceLock<Regex> = OnceLock::new();
     re(
         &R,
-        r"(?i)(\bул\.|\bулиц|\bпр-т|\bпроспект|\bпер\.|\bпереул|\bшоссе|\bбульвар|\bб-р|\bнаб\.|\bнабережн|\bпл\.|\bплощад|\bмкр|\bмикрорайон|\bд\.\s*\d|\bдом\s+\d|\d+\s+[a-z0-9 .'-]{2,40}?\s(?:street|st|avenue|ave|road|rd|boulevard|blvd|lane|ln|drive|dr|place|pl|court|ct|parkway|pkwy|highway|hwy|way|square|sq|terrace)\b|\b(?:suite|ste\.)\s?\d|[a-zäöüß-]{3,}(?:straße|strasse|str\.|weg|allee|platz|gasse|damm|ufer|ring|chaussee)\s*\d|\b(?:rue|avenue|boulevard|bd|chemin|impasse|allée|place|quai)\s+(?:de\s|du\s|des\s|la\s|l')?\w|\b(?:calle|c/|avenida|avda\.?|plaza|paseo|carrer|rua|travessa|largo)\s+\w|\b(?:via|viale|piazza|corso|vicolo|largo)\s+[a-zà-ù]|\bul\.\s?\w|\baleja\b|[a-z]{3,}(?:straat|laan|weg|plein|gracht|kade|singel)\s*\d|\b[a-z]{2}\s\d{5}(?:-\d{4})?\b|\b\d{5}\s+[a-zäöüß][a-zäöüß-]{2,}|\b[a-z]{1,2}\d[a-z\d]?\s?\d[a-z]{2}\b)",
+        r"(?i)(\bул\.|\bулиц|\bпр-т|\bпр-кт|\bпросп\.|\bпр\.\s?[а-яё]{4,}[\s,]+(?:д\.\s?)?\d|\bпроспект|\bпер\.|\bпереул|\bшоссе|\bбульвар|\bб-р|\bнаб\.|\bнабережн|\bпл\.|\bплощад|\bмкр|\bмикрорайон|\bд\.\s*\d|\bдом\s+\d|\d+\s+[a-z0-9 .'-]{2,40}?\s(?:street|st|avenue|ave|road|rd|boulevard|blvd|lane|ln|drive|dr|place|pl|court|ct|parkway|pkwy|highway|hwy|way|square|sq|terrace)\b|\b(?:suite|ste\.)\s?\d|[a-zäöüß-]{3,}(?:straße|strasse|str\.|weg|allee|platz|gasse|damm|ufer|ring|chaussee)\s*\d|\b(?:rue|avenue|boulevard|bd|chemin|impasse|allée|place|quai)\s+(?:de\s|du\s|des\s|la\s|l')?\w|\b(?:calle|c/|avenida|avda\.?|plaza|paseo|carrer|rua|travessa|largo)\s+\w|\b(?:via|viale|piazza|corso|vicolo|largo)\s+[a-zà-ù]|\bul\.\s?\w|\baleja\b|[a-z]{3,}(?:straat|laan|weg|plein|gracht|kade|singel)\s*\d|\b[a-z]{2}\s\d{5}(?:-\d{4})?\b|\b\d{5}\s+[a-zäöüß][a-zäöüß-]{2,}|\b[a-z]{1,2}\d[a-z\d]?\s?\d[a-z]{2}\b)",
     )
 }
 
@@ -36,7 +36,7 @@ pub fn hours_re() -> &'static Regex {
     static R: OnceLock<Regex> = OnceLock::new();
     re(
         &R,
-        r"(?i)(\b\d{1,2}[:.]\d{2}\s*(?:uhr|h)?\s*[-–—]\s*\d{1,2}[:.]\d{2}\b|\b\d{1,2}(?::\d{2})?\s?(?:am|pm)\s*[-–—]\s*\d{1,2}(?::\d{2})?\s?(?:am|pm)\b|\b\d{1,2}h\d{0,2}\s*[-–—à]\s*\d{1,2}h|круглосуточно|без выходных|24/7|open 24 hours|24 hours|rund um die uhr|öffnungszeiten|opening hours|business hours|horaires|horario|orari|openingstijden|godziny otwarcia|\bmo\.?\s*[-–]\s*fr\b|\bmon\.?\s*[-–]\s*fri\b|\blun\.?\s*[-–]\s*ven\b)",
+        r"(?i)(\b\d{1,2}[:.]\d{2}\s*(?:uhr|h)?\s*[-–—]\s*\d{1,2}[:.]\d{2}\b|\b\d{1,2}(?::\d{2})?\s?(?:am|pm)\s*[-–—]\s*\d{1,2}(?::\d{2})?\s?(?:am|pm)\b|\b\d{1,2}h\d{0,2}\s*[-–—à]\s*\d{1,2}h|круглосуточно|без выходных|24/7|open 24 hours|24 hours|rund um die uhr|öffnungszeiten|opening hours|business hours|horaires|horario|orari|openingstijden|godziny otwarcia|\bmo\.?\s*[-–]\s*fr\b|\bmon\.?\s*[-–]\s*fri\b|\blun\.?\s*[-–]\s*ven\b|\b\d{1,2}[:.]\d{2}\s*(?:до|to|bis|à|a|al|tot|do|às|till|until)\s*\d{1,2}[:.]\d{2}\b|\b(?:с|от|from|von|de|da|dalle|od)\s*\d{1,2}(?:[:.]\d{2})?\s*(?:до|to|bis|à|a|al|alle|tot|do|às|until)\s*\d{1,2}(?:[:.]\d{2})?\s*(?:ч\b|h\b|uhr|am|pm)?|\b(?:пн|пон\w*)\.?\s*[-–—]\s*(?:пт|птн|пятн\w*|сб|суб\w*|вс)\b|\b(?:mon\w*|montag|lundi|lunes|luned[iì]|poniedzia\w+|segunda|maandag)\s*(?:[-–—]|to|bis|au|a|al|t/m|do|até)\s*(?:fri\w*|sat\w*|freitag|samstag|vendredi|samedi|viernes|s[aá]bado|venerd[iì]|sabato|pi\w+tek|sobota|sexta|vrijdag|zaterdag)|время работы|режим работы|график работы|часы работы|часы приёма|часы приема|heures d.ouverture|öffnungszeit|horarios|hor[aá]rio de|godzin\w* pracy)",
     )
 }
 
@@ -182,6 +182,8 @@ pub const PLACEHOLDER: &[&str] = &[
     "seite im aufbau", "website im aufbau", "webseite im aufbau", "in kürze verfügbar", "en construcción",
     "próximamente", "sitio en construcción", "in costruzione", "sito in costruzione", "prossimamente", "w budowie",
     "strona w budowie", "in aanbouw", "binnenkort online", "em construção", "launching soon", "blank page",
+    // Заглушка Hover («… is a totally awesome idea still being worked on. Check back later.»).
+    "still being worked on", "awesome idea still",
 ];
 
 /// Ошибка движка или базы данных вместо главной (B01).
@@ -211,6 +213,8 @@ pub const PARKED: &[&str] = &[
     "сайт не обслуживается", "domain has been assigned", "please renew your subscription", "renew your subscription",
     "start.hoster.by", "сайт заблокирован за неуплату", "срок оплаты хостинга", "forsale.godaddy", "выставлен на продажу",
     "парковка доменов", "is for sale", "dan.com", "afternic", "sedo.com", "/lander",
+    // GoDaddy Corporate Domains: «Protected Domain Holder» (gcd.com) — домен держат, сайта нет.
+    "protected domain holder", "gcd.com/protected-domain", "protected by godaddy corporate domains",
     "default web page", "welcome to nginx", "apache2 ubuntu default page", "apache2 debian default page",
     "web server's default page", "no web site at this address", "test page for the apache", "iis windows server",
     "index of /", "сайт заблокирован", "срок регистрации домена истек", "срок регистрации домена истёк",
@@ -225,8 +229,35 @@ pub const ABOUT: &[&str] = &[
     "о компании", "о нас", "о клинике", "о салоне", "/about", "o-kompanii", "o-nas", "o-klinike", "about-us",
     "about us", "über uns", "ueber-uns", "uber-uns", "/praxis", "a-propos", "à propos", "qui-sommes-nous",
     "qui sommes-nous", "sobre nosotros", "quienes-somos", "quiénes somos", "chi siamo", "chi-siamo", "over ons",
-    "over-ons", "o nas", "sobre-nos", "sobre nós", "/team", "/equipe", "/equipo",
+    "over-ons", "o nas", "sobre-nos", "sobre nós", "/team", "/equipe", "/equipo", "/company", "о-нас", "о-компании", "о-клинике",
+    "/o-nas", "/o-firmie", "/sobre", "/nosotros", "/chi-siamo", "/over-ons", "/uber-uns", "/uberuns",
 ];
+
+/// Адрес без %-кодирования («/%D0%BE-%D0%BD%D0%B0%D1%81» → «/о-нас»).
+fn percent_decode(s: &str) -> String {
+    let b = s.as_bytes();
+    let mut out = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == b'%' && i + 2 < b.len() && let Ok(v) = u8::from_str_radix(&s[i + 1..i + 3], 16) {
+            out.push(v);
+            i += 3;
+        } else {
+            out.push(b[i]);
+            i += 1;
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// Ссылка ведёт на страницу «О компании»: по адресу, тексту ссылки или короткой подписи «About».
+pub fn is_about_link(href: &str, text: &str) -> bool {
+    let t = text.trim().to_lowercase();
+    let h = percent_decode(href).to_lowercase();
+    let s = format!("{h} {t}");
+    ABOUT.iter().any(|m| s.contains(m))
+        || matches!(t.trim_end_matches(['.', '!']), "about" | "company" | "компания" | "о нас" | "über uns" | "à propos" | "acerca de" | "chi siamo" | "over ons" | "sobre nós" | "o nas" | "o firmie")
+}
 
 /// Разделы статей и новостей (F19, I11) — части адреса.
 pub const BLOG: &[&str] = &[
@@ -371,6 +402,10 @@ pub const REVIEW_WIDGETS: &[&str] = &[
     "maps-reviews-widget", "reviews-widget", "★", "elfsight", "trustindex", "trustpilot", "birdeye", "podium.com",
     "yotpo", "judge.me", "provenexpert", "ekomi", "trustedshops", "reviews.io", "grade.us", "embedsocial",
     "featurable", "widget.reviews", "sociablekit", "jameda-siegel", "google-reviews",
+    // Бейдж рейтинга Яндекс Карт и виджеты 2ГИС (belstom.by: iframe yandex.ru/sprav/widget/rating-badge).
+    "sprav/widget/rating-badge", "rating-badge", "widget.2gis", "2gis.ru/widget", "reviews-widget.2gis",
+    // Самодельные блоки отзывов (brooklynburgersandbeer.com: div.reviewsBlock со звёздами).
+    "reviewsblock", "reviews-block", "review-item", "reviews-list", "review-card", "testimonial-item", "otzyvy-block",
 ];
 
 /// Слова «отзыв» на главной (N06).
@@ -408,6 +443,9 @@ mod tests {
             assert!(price_re().is_match(s), "{s}");
         }
         assert!(!price_re().is_match("2019 год, 15 врачей"));
+        // Сокращение «р» без точки (dentalelit.by: «от 40 р», «от 1500 р»).
+        assert!(price_re().is_match("пломба от 40 р, коронка от 950 р"));
+        assert!(!price_re().is_match("2 раза в год, 3 ребёнка"));
         assert!(PLACEHOLDER.iter().any(|m| "сайт mz.by находится в разработке".contains(m)), "заглушка с доменом в тексте");
         for d in ["yandex.by", "163.com", "tut.by", "yahoo.es", "hotmail.co.uk", "mail.ru", "gmail.com"] {
             assert!(is_free_email(d), "{d}");
@@ -431,15 +469,37 @@ mod tests {
             "keizersgracht 12",
             "brooklyn, ny 11216",
             "london sw1a 1aa",
+            // kapadent.by: «пр.» с точкой вместо «пр-т».
+            "г. минск, пр. дзержинского, 9, пом. 1037",
+            "просп. независимости, 58",
         ] {
             assert!(address_re().is_match(s), "{s}");
         }
         assert!(!address_re().is_match("мы работаем с 2010 года"));
+        assert!(!address_re().is_match("скидки на чистку и пр. услуги"));
     }
 
     #[test]
     fn opening_hours() {
-        for s in ["9:00–21:00", "9am - 5pm", "mo-fr 8.00 - 18.00 uhr", "круглосуточно", "open 24 hours", "9h-19h"] {
+        for s in [
+            "9:00–21:00",
+            "9am - 5pm",
+            "mo-fr 8.00 - 18.00 uhr",
+            "круглосуточно",
+            "open 24 hours",
+            "9h-19h",
+            "Время работы: с 8:00 до 21:00 понедельник-пятница, суббота по графику",
+            "пн-птн 10.00-20.00, сб: 10.00-15.00",
+            "Mon–Fri 9am–6pm",
+            "Monday to Friday, 9 to 5",
+            "Lundi au vendredi 9h–18h",
+            "Lunes a viernes de 9:00 a 18:00",
+            "Montag bis Freitag 8 bis 17 Uhr",
+            "Lunedì-venerdì dalle 9 alle 18",
+            "Poniedziałek–piątek 9:00 do 17:00",
+            "Segunda a sexta das 9h às 18h",
+            "Maandag t/m vrijdag 9:00 tot 17:00",
+        ] {
             assert!(hours_re().is_match(s), "{s}");
         }
     }

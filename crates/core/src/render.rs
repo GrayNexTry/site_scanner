@@ -119,6 +119,56 @@ pub async fn dump_dom(browser: &Path, url: &str, user_agent: &str, accept_langua
     }
 }
 
+/// Страница → PDF (формат из `@page`) без колонтитулов браузера: в отчёте для клиента ни к чему
+/// адрес 127.0.0.1, дата печати и «Стр. 3 из 4». Скрипты страницы успевают загрузить данные
+/// (виртуальное время ждёт сетевые запросы).
+pub async fn print_pdf(browser: &Path, url: &str, timeout: Duration) -> Result<Vec<u8>, String> {
+    let _slot = slots().acquire().await.map_err(|e| e.to_string())?;
+    let dir = std::env::temp_dir().join(format!("maps-seo-scanner-pdf-{}-{}", std::process::id(), rand_suffix()));
+    let out = dir.join("report.pdf");
+    let headless_shell = browser.file_name().and_then(|n| n.to_str()).is_some_and(|n| n.contains("headless"));
+    let mut cmd = tokio::process::Command::new(browser);
+    if !headless_shell {
+        cmd.arg("--headless=new");
+    }
+    cmd.args([
+        "--disable-gpu",
+        "--no-first-run",
+        "--no-default-browser-check",
+        "--disable-extensions",
+        "--disable-background-networking",
+        "--disable-sync",
+        "--mute-audio",
+        "--hide-scrollbars",
+        // Новый и старый headless называют отключение колонтитулов по-разному.
+        "--no-pdf-header-footer",
+        "--print-to-pdf-no-header",
+        "--run-all-compositor-stages-before-draw",
+        "--virtual-time-budget=15000",
+    ])
+    .arg(format!("--user-data-dir={}", dir.join("profile").display()))
+    .arg(format!("--print-to-pdf={}", out.display()))
+    .arg(url)
+    .stdin(Stdio::null())
+    .stdout(Stdio::null())
+    .stderr(Stdio::null())
+    .kill_on_drop(true);
+    let result = async {
+        let mut child = cmd.spawn().map_err(|e| format!("браузер не запустился: {e}"))?;
+        match tokio::time::timeout(timeout, child.wait()).await {
+            Ok(Ok(_)) => tokio::fs::read(&out).await.map_err(|e| format!("браузер не сохранил PDF: {e}")),
+            Ok(Err(e)) => Err(e.to_string()),
+            Err(_) => Err(format!("PDF дольше {} с", timeout.as_secs())),
+        }
+    }
+    .await;
+    let _ = tokio::fs::remove_dir_all(&dir).await;
+    match result {
+        Ok(pdf) if !pdf.starts_with(b"%PDF") => Err("браузер вернул не PDF".into()),
+        other => other,
+    }
+}
+
 fn rand_suffix() -> u64 {
     use std::time::{SystemTime, UNIX_EPOCH};
     SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_nanos() as u64).unwrap_or(0)

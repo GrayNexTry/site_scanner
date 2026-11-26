@@ -140,6 +140,10 @@ pub async fn discover(f: &Fetcher, b: &Business, params: &ScanParams, opt: &Disc
                 strong.push(Candidate { url: link.to_string(), source: Source::CardLink, via: link.to_string() })
             }
             SiteKind::LinkInBio | SiteKind::Messenger | SiteKind::Social | SiteKind::Booking => {
+                // Ник вида «aldent.by» — часто и есть домен сайта.
+                if let Some(domain) = domain_in_handle(link) {
+                    strong.push(Candidate { url: format!("https://{domain}/"), source: Source::SocialLink, via: link.to_string() });
+                }
                 for url in links_from_profile(f, link).await {
                     strong.push(Candidate { url, source: Source::SocialLink, via: link.to_string() });
                 }
@@ -217,6 +221,38 @@ pub async fn discover(f: &Fetcher, b: &Business, params: &ScanParams, opt: &Disc
     d
 }
 
+/// Доменные зоны, по которым ник соцсети считается доменом (чтобы не принять «photo.jpg» за сайт).
+const HANDLE_TLDS: &[&str] = &[
+    "by", "ru", "com", "net", "org", "info", "biz", "ua", "kz", "uz", "kg", "md", "lv", "lt", "ee", "pl", "de", "fr", "es", "it", "pt", "nl", "uk", "us", "eu", "io",
+    "co", "me", "clinic", "dental", "moscow", "spb", "minsk", "pro", "shop", "store", "online", "site", "su", "рф", "be", "ch", "at", "cz", "ro", "gr", "tr", "ca", "au",
+];
+
+/// Домен, зашитый в ник/путь профиля соцсети: instagram.com/aldent.by → aldent.by.
+pub fn domain_in_handle(profile: &str) -> Option<String> {
+    let u = parse_url_lenient(profile)?;
+    let seg = u.path_segments()?.find(|s| !s.is_empty())?;
+    let seg = seg.trim_start_matches('@').trim_start_matches('+').to_lowercase();
+    if seg.len() < 4 || seg.contains("..") || !seg.contains('.') {
+        return None;
+    }
+    if !seg.chars().all(|c| c.is_alphanumeric() || c == '.' || c == '-') {
+        return None;
+    }
+    let labels: Vec<&str> = seg.split('.').collect();
+    if labels.iter().any(|l| l.is_empty() || l.starts_with('-') || l.ends_with('-')) {
+        return None;
+    }
+    let tld = *labels.last()?;
+    if !HANDLE_TLDS.contains(&tld) {
+        return None;
+    }
+    // Служебные пути соцсетей (share.php, profile.php) — не ник.
+    if matches!(labels[0], "profile" | "share" | "index" | "people") && labels.len() == 2 {
+        return None;
+    }
+    Some(seg)
+}
+
 fn cand_key(url: &str) -> String {
     parse_url_lenient(url).map(|u| registrable_domain(&host_of(&u))).unwrap_or_else(|| url.to_string())
 }
@@ -260,6 +296,27 @@ pub async fn verify(f: &Fetcher, c: &Candidate, b: &Business, params: &ScanParam
     if crate::lexicon::PARKED.iter().any(|m| text.contains(m)) || (info.words < 120 && crate::lexicon::PLACEHOLDER.iter().any(|m| text.contains(m))) {
         return None;
     }
+    // Домен перехвачен под казино и ставки (beldruk.by у шести минских компаний) — не сайт компании.
+    if crate::checks::gambling_hijack(&b.name, b.category.as_deref(), &text, info.title.as_deref()) {
+        return None;
+    }
+    // Внутренняя страница чужого домена — чаще всего карточка в каталоге (kramba.by/mesto/…,
+    // talon.by/policlinic/…, pointer.by/company/…, справочники любой страны): на главной такого
+    // домена много текста, но нет ни названия компании, ни её телефона и адреса.
+    if !blocked && inner_page(&final_url) {
+        let root = format!("{}/", final_url.origin().ascii_serialization());
+        if let Ok(r) = f.get(&root, None).await
+            && r.ok()
+        {
+            let ri = page::extract(&r.body, &r.final_url);
+            let rt = ri.text_lower();
+            let mut root_ev = Evidence { score: 0.0, notes: vec![], phone: false, address: false };
+            root_ev.check_page(&ri, &rt, &r.body, b, params);
+            if ri.words >= 150 && root_ev.score < SUGGEST {
+                return None;
+            }
+        }
+    }
     let mut ev = Evidence::new(c.source);
     if blocked {
         ev.add(0.0, "сайт закрыт защитой от ботов — проверить вручную");
@@ -295,6 +352,20 @@ pub async fn verify(f: &Fetcher, c: &Candidate, b: &Business, params: &ScanParam
         confirmed: score >= CONFIRM,
         evidence: ev.notes,
         title: info.title.clone().or_else(|| info.og("og:site_name").map(str::to_string)),
+    })
+}
+
+/// Страница не главная: в пути есть что-то кроме кода языка («/ru/», «/en-gb/») и index-файла.
+fn inner_page(u: &url::Url) -> bool {
+    u.path_segments().is_some_and(|segs| {
+        segs.filter(|s| !s.is_empty())
+            .filter(|s| {
+                let s = s.to_lowercase();
+                let lang = s.len() == 2 || (s.len() == 5 && s.as_bytes()[2] == b'-');
+                !lang && !s.starts_with("index.")
+            })
+            .count()
+            >= 1
     })
 }
 
@@ -384,6 +455,30 @@ impl Evidence {
 
 /// Телефоны в сыром HTML, включая JSON и скрипты (конструкторы вроде Wix кладут номер
 /// только туда). Совпадение последних 9 цифр с карточкой случайно не бывает.
+/// Название — просто вид деятельности («Стаматалогія», «Аптека», «Кафе», «Dental Clinic»):
+/// одинаковые такие названия у разных точек района — не сеть (скан 27: шесть разных клиник
+/// «Стаматалогія» в OSM получали «точка сети — сайтом занимается головная компания»).
+pub fn generic_name(name: &str, category: Option<&str>) -> bool {
+    // Белорусское и русское написание сводим: і→и, ў→в, э→е, ы→и, о→а (аканье).
+    let fold = |s: &str| {
+        s.to_lowercase().replace('ё', "е").replace('і', "и").replace('ў', "в").replace('э', "е").replace('ы', "и").replace('о', "а").replace('o', "a")
+    };
+    const EXTRA: &[&str] = &[
+        "стоматологический", "стоматологическая", "кабинет", "поликлиника", "больница", "аптека", "аптэка", "кафе", "кофейня",
+        "кавярня", "магазин", "крама", "продукты", "прадукты", "парикмахерская", "цырульня", "красоты", "прыгажосци", "шиномонтаж",
+        "автомойка", "аутамыйка", "химчистка", "ателье", "отделение", "аддзяленне", "почта", "пошта", "медицинский", "медыцынски",
+        "цэнтр", "минск", "минска", "pharmacy", "dentist", "dental", "clinic", "bakery", "pub", "pharmacie", "apotheke", "farmacia",
+        "boulangerie", "tabac", "kiosk", "киоск", "банкомат", "atm", "post", "office", "school", "школа", "детский", "сад",
+    ];
+    let words: Vec<String> =
+        normalize_name(name).split_whitespace().map(fold).filter(|w| w.chars().count() >= 3 && w.chars().any(char::is_alphabetic)).collect();
+    if words.is_empty() {
+        return true;
+    }
+    let cat = category.map(fold).unwrap_or_default();
+    words.iter().all(|w| GENERIC.iter().chain(EXTRA).any(|g| fold(g) == *w) || (cat.len() >= 4 && cat.contains(w.as_str())))
+}
+
 pub fn raw_phone_keys(html: &str) -> Vec<String> {
     use std::sync::OnceLock;
     static RE: OnceLock<regex::Regex> = OnceLock::new();
@@ -392,7 +487,7 @@ pub fn raw_phone_keys(html: &str) -> Vec<String> {
 }
 
 /// Общие слова названий, по которым нельзя узнать компанию.
-const GENERIC: &[&str] = &[
+pub(crate) const GENERIC: &[&str] = &[
     "стоматология", "стоматологическая", "стоматологический", "клиника", "клиники", "салон", "красоты", "студия", "центр",
     "магазин", "мастерская", "парикмахерская", "барбершоп", "кафе", "ресторан", "бар", "медицинский", "центра", "сервис",
     "автосервис", "dental", "dentist", "dentistry", "clinic", "salon", "studio", "center", "centre", "shop", "store",
@@ -611,6 +706,41 @@ const GENERIC_LATIN: &[&str] = &[
 mod tests {
     use super::*;
 
+    /// Название-вид деятельности — не бренд сети; настоящее название — бренд.
+    #[test]
+    fn generic_names_are_not_chains() {
+        assert!(generic_name("Стаматалогія", Some("Стоматология")));
+        assert!(generic_name("Аптека", None));
+        assert!(generic_name("Стоматологическая поликлиника №13", None));
+        assert!(generic_name("Dental Clinic", None));
+        assert!(!generic_name("Ваш дантыст", Some("Стоматология")));
+        assert!(!generic_name("Евроопт", None));
+        assert!(!generic_name("Белпошта", None));
+    }
+
+    /// Каталоги Минска, найденные поиском вместо сайта клиники, и такие же справочники Европы и США.
+    #[test]
+    fn directories_are_not_company_sites() {
+        for u in [
+            "https://kramba.by/mesto/151620-stamatalog-ya-doktara-zyal-nskaga-8f469",
+            "https://pointer.by/company/dentabel-190388418",
+            "https://dosug.by/katalog/krasota-i-zdorove/otbelivanie-zubov/zubki-by",
+            "https://talon.by/policlinic/aldent",
+            "https://www.cylex.co.uk/company/smile-dental-12345.html",
+            "https://www.societe.com/societe/cabinet-dentaire-123456789.html",
+            "https://www.northdata.de/Zahnarztpraxis+Dr.+M%C3%BCller,+Berlin",
+        ] {
+            assert_eq!(classify_website(u).0, SiteKind::Aggregator, "{u}");
+        }
+        let p = |s: &str| url::Url::parse(s).unwrap();
+        assert!(inner_page(&p("https://kramba.by/mesto/151620-dantyst")));
+        assert!(inner_page(&p("https://clinic.example/uslugi/implantaciya")));
+        // Главная и её языковые версии — не внутренняя страница.
+        assert!(!inner_page(&p("https://clinic.by/")));
+        assert!(!inner_page(&p("https://clinic.by/ru/")));
+        assert!(!inner_page(&p("https://brand.com/en-gb/index.html")));
+    }
+
     #[test]
     fn guesses_domains() {
         let g = guess_domains("GiGi Glam Box", Some("us"), &["salon", "hair"]);
@@ -626,6 +756,19 @@ mod tests {
         let g = guess_domains("Zahnarztpraxis Dr. Müller", Some("de"), &["dent"]);
         assert!(g.iter().any(|d| d.starts_with("mueller") || d.starts_with("drmueller")), "{g:?}");
         assert!(g.len() <= 18);
+    }
+
+    #[test]
+    fn domain_in_social_handle() {
+        assert_eq!(domain_in_handle("https://www.instagram.com/aldent.by/").as_deref(), Some("aldent.by"));
+        assert_eq!(domain_in_handle("https://instagram.com/aldent.by?igsh=abc").as_deref(), Some("aldent.by"));
+        assert_eq!(domain_in_handle("https://t.me/pizza-roma.com").as_deref(), Some("pizza-roma.com"));
+        assert_eq!(domain_in_handle("https://www.tiktok.com/@salon.moscow.ru").as_deref(), Some("salon.moscow.ru"));
+        assert_eq!(domain_in_handle("https://vk.com/clinic.minsk.by").as_deref(), Some("clinic.minsk.by"));
+        assert_eq!(domain_in_handle("https://facebook.com/zahnarzt-mueller.de").as_deref(), Some("zahnarzt-mueller.de"));
+        assert_eq!(domain_in_handle("https://instagram.com/dental_minsk"), None);
+        assert_eq!(domain_in_handle("https://facebook.com/profile.php?id=100"), None);
+        assert_eq!(domain_in_handle("https://instagram.com/p/abc.jpg"), None);
     }
 
     #[test]

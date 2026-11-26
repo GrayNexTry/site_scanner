@@ -4,11 +4,14 @@
 //! Проверка одного сайта из консоли: `maps-seo-scanner audit <url> [--country de] …`.
 //! Данные — в $XDG_DATA_HOME/maps-seo-scanner (по умолчанию ~/.local/share/maps-seo-scanner).
 
+mod ai;
 mod api;
 mod assets;
 mod cli_audit;
 mod db;
 mod jobs;
+mod mail;
+mod oauth;
 mod settings;
 
 use std::net::SocketAddr;
@@ -86,6 +89,8 @@ async fn main() -> anyhow::Result<()> {
         info!("прерванных сканов: {interrupted} — их можно доделать кнопкой «Продолжить»");
     }
     let state = jobs::AppState::new(db).await?;
+    // Рассылка по почте: фоновая задача, спит, пока её не запустят и пока в очереди нет писем.
+    mail::spawn_worker(state.clone());
     // Старые проверки без мини-отчёта — пересчитать из сохранённых результатов (без сети).
     {
         let st = state.clone();
@@ -103,6 +108,7 @@ async fn main() -> anyhow::Result<()> {
             }
         });
     }
+    api::set_self_url(cli.listen);
     let app = api::router(state);
     let listener = tokio::net::TcpListener::bind(cli.listen).await.with_context(|| format!("порт {} занят?", cli.listen))?;
     let url = format!("http://{}", cli.listen);

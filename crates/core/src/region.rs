@@ -219,6 +219,192 @@ pub fn country_from_host(host: &str) -> Option<String> {
     Some(c.to_string())
 }
 
+/// Часовой пояс IANA для страны скана и точки (координаты компании или центра скана) — чтобы письма
+/// приходили в рабочее время получателя. Для стран с несколькими поясами (США, Канада, Россия, Австралия,
+/// Бразилия, Мексика, Индонезия) пояс выбирается по долготе и широте с точностью до региона: на границах
+/// поясов возможна ошибка в час. None — страна неизвестна (тогда время считается по долготе).
+pub fn time_zone(country: Option<&str>, lat: f64, lon: f64) -> Option<&'static str> {
+    let c = country?.trim().to_ascii_lowercase();
+    let single = match c.as_str() {
+        "by" => "Europe/Minsk",
+        "ua" => "Europe/Kiev",
+        "md" => "Europe/Chisinau",
+        "lt" => "Europe/Vilnius",
+        "lv" => "Europe/Riga",
+        "ee" => "Europe/Tallinn",
+        "pl" => "Europe/Warsaw",
+        "de" => "Europe/Berlin",
+        "fr" => "Europe/Paris",
+        "es" if lon < -12.0 => "Atlantic/Canary",
+        "es" => "Europe/Madrid",
+        "pt" if lon < -20.0 => "Atlantic/Azores",
+        "pt" => "Europe/Lisbon",
+        "it" => "Europe/Rome",
+        "nl" => "Europe/Amsterdam",
+        "be" => "Europe/Brussels",
+        "lu" => "Europe/Luxembourg",
+        "ch" => "Europe/Zurich",
+        "li" => "Europe/Vaduz",
+        "at" => "Europe/Vienna",
+        "cz" => "Europe/Prague",
+        "sk" => "Europe/Bratislava",
+        "hu" => "Europe/Budapest",
+        "si" => "Europe/Ljubljana",
+        "hr" => "Europe/Zagreb",
+        "ba" => "Europe/Sarajevo",
+        "rs" => "Europe/Belgrade",
+        "me" => "Europe/Podgorica",
+        "mk" => "Europe/Skopje",
+        "al" => "Europe/Tirane",
+        "gr" => "Europe/Athens",
+        "bg" => "Europe/Sofia",
+        "ro" => "Europe/Bucharest",
+        "cy" => "Asia/Nicosia",
+        "mt" => "Europe/Malta",
+        "ie" => "Europe/Dublin",
+        "gb" | "uk" => "Europe/London",
+        "is" => "Atlantic/Reykjavik",
+        "no" => "Europe/Oslo",
+        "se" => "Europe/Stockholm",
+        "fi" => "Europe/Helsinki",
+        "dk" => "Europe/Copenhagen",
+        "tr" => "Europe/Istanbul",
+        "ge" => "Asia/Tbilisi",
+        "am" => "Asia/Yerevan",
+        "az" => "Asia/Baku",
+        // С 2024 года весь Казахстан в одном поясе (UTC+5); правила — в базе часовых поясов системы.
+        "kz" => "Asia/Almaty",
+        "uz" => "Asia/Tashkent",
+        "kg" => "Asia/Bishkek",
+        "tj" => "Asia/Dushanbe",
+        "tm" => "Asia/Ashgabat",
+        "il" => "Asia/Jerusalem",
+        "ae" => "Asia/Dubai",
+        "sa" => "Asia/Riyadh",
+        "qa" => "Asia/Qatar",
+        "eg" => "Africa/Cairo",
+        "ma" => "Africa/Casablanca",
+        "za" => "Africa/Johannesburg",
+        "ng" => "Africa/Lagos",
+        "ke" => "Africa/Nairobi",
+        "in" => "Asia/Kolkata",
+        "pk" => "Asia/Karachi",
+        "bd" => "Asia/Dhaka",
+        "lk" => "Asia/Colombo",
+        "np" => "Asia/Kathmandu",
+        "cn" => "Asia/Shanghai",
+        "hk" => "Asia/Hong_Kong",
+        "tw" => "Asia/Taipei",
+        "jp" => "Asia/Tokyo",
+        "kr" => "Asia/Seoul",
+        "th" => "Asia/Bangkok",
+        "vn" => "Asia/Ho_Chi_Minh",
+        "sg" => "Asia/Singapore",
+        "my" => "Asia/Kuala_Lumpur",
+        "ph" => "Asia/Manila",
+        "nz" => "Pacific/Auckland",
+        "ar" => "America/Argentina/Buenos_Aires",
+        "cl" => "America/Santiago",
+        "co" => "America/Bogota",
+        "pe" => "America/Lima",
+        "uy" => "America/Montevideo",
+        "ve" => "America/Caracas",
+        "ec" => "America/Guayaquil",
+        "us" => return Some(us_zone(lat, lon)),
+        "ca" => return Some(ca_zone(lon)),
+        "ru" => return Some(ru_zone(lat, lon)),
+        "au" => return Some(au_zone(lat, lon)),
+        "br" => return Some(if lon < -66.5 { "America/Rio_Branco" } else if lon < -54.0 && lat > -24.0 { "America/Manaus" } else { "America/Sao_Paulo" }),
+        "mx" => return Some(mx_zone(lat, lon)),
+        "id" => return Some(if lon < 114.6 { "Asia/Jakarta" } else if lon < 124.0 { "Asia/Makassar" } else { "Asia/Jayapura" }),
+        _ => return None,
+    };
+    Some(single)
+}
+
+fn us_zone(lat: f64, lon: f64) -> &'static str {
+    if lon < -154.0 && lat < 23.0 {
+        "Pacific/Honolulu"
+    } else if lat > 51.0 && lon < -129.0 {
+        "America/Anchorage"
+    } else if (31.0..37.0).contains(&lat) && (-114.8..-109.05).contains(&lon) {
+        // Аризона: без перехода на летнее время.
+        "America/Phoenix"
+    } else if lon >= -86.5 {
+        "America/New_York"
+    } else if lon >= -101.5 {
+        "America/Chicago"
+    } else if lon >= -114.5 || ((42.0..45.5).contains(&lat) && lon >= -117.0) {
+        "America/Denver"
+    } else {
+        "America/Los_Angeles"
+    }
+}
+
+fn ca_zone(lon: f64) -> &'static str {
+    match lon {
+        l if l < -120.0 => "America/Vancouver",
+        l if l < -110.0 => "America/Edmonton",
+        l if l < -102.0 => "America/Regina",
+        l if l < -90.0 => "America/Winnipeg",
+        l if l < -64.0 => "America/Toronto",
+        l if l < -59.5 => "America/Halifax",
+        _ => "America/St_Johns",
+    }
+}
+
+fn ru_zone(lat: f64, lon: f64) -> &'static str {
+    // Самарское время (UTC+4): Самара, Саратов, Ульяновск, Астрахань, Удмуртия; Татарстан и Киров — московское.
+    let samara = ((45.5..54.0).contains(&lon) && lat < 54.0) || ((51.0..54.0).contains(&lon) && (56.0..58.5).contains(&lat));
+    match lon {
+        l if l < 23.0 => "Europe/Kaliningrad",
+        _ if samara => "Europe/Samara",
+        l if l < 54.0 => "Europe/Moscow",
+        // Коми и Архангельская область севернее 59° — московское время.
+        l if l < 60.0 && lat > 59.0 => "Europe/Moscow",
+        l if l < 73.0 => "Asia/Yekaterinburg",
+        l if l < 77.0 => "Asia/Omsk",
+        l if l < 88.0 => "Asia/Novosibirsk",
+        l if l < 100.0 => "Asia/Krasnoyarsk",
+        l if l < 113.0 => "Asia/Irkutsk",
+        l if l < 130.0 => "Asia/Yakutsk",
+        l if l < 142.0 => "Asia/Vladivostok",
+        l if l < 144.5 && lat < 54.5 => "Asia/Sakhalin",
+        l if l > 155.0 && (lat > 50.0 || l > 165.0) => "Asia/Kamchatka",
+        _ => "Asia/Magadan",
+    }
+}
+
+fn au_zone(lat: f64, lon: f64) -> &'static str {
+    if lon < 129.0 {
+        "Australia/Perth"
+    } else if lon < 138.0 {
+        if lat > -26.0 { "Australia/Darwin" } else { "Australia/Adelaide" }
+    } else if lon < 141.0 && lat < -26.0 {
+        "Australia/Adelaide"
+    } else if lat > -29.0 {
+        "Australia/Brisbane"
+    } else if lat < -39.5 {
+        "Australia/Hobart"
+    } else {
+        "Australia/Sydney"
+    }
+}
+
+fn mx_zone(lat: f64, lon: f64) -> &'static str {
+    if lon < -114.7 && lat > 28.0 {
+        "America/Tijuana"
+    } else if lon < -108.5 && lat > 26.0 {
+        "America/Hermosillo"
+    } else if lon < -104.5 {
+        "America/Mazatlan"
+    } else if lon > -88.0 && lat < 22.0 {
+        "America/Cancun"
+    } else {
+        "America/Mexico_City"
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -241,6 +427,30 @@ mod tests {
         assert_eq!(accept_language(Some("de")), "de-DE,de;q=0.9,en;q=0.7");
         assert_eq!(accept_language(Some("us")), "en-US,en;q=0.9");
         assert_eq!(accept_language(None), "ru-RU,ru;q=0.9,en;q=0.7");
+    }
+
+    #[test]
+    fn time_zones_by_country_and_point() {
+        assert_eq!(time_zone(Some("BY"), 53.9, 27.56), Some("Europe/Minsk"));
+        assert_eq!(time_zone(Some("gb"), 51.5, -0.12), Some("Europe/London"));
+        // Москва, Казань (московское), Самара (+4), Екатеринбург, Новосибирск, Владивосток, Калининград.
+        assert_eq!(time_zone(Some("ru"), 55.75, 37.62), Some("Europe/Moscow"));
+        assert_eq!(time_zone(Some("ru"), 55.79, 49.12), Some("Europe/Moscow"));
+        assert_eq!(time_zone(Some("ru"), 53.2, 50.15), Some("Europe/Samara"));
+        assert_eq!(time_zone(Some("ru"), 56.84, 60.6), Some("Asia/Yekaterinburg"));
+        assert_eq!(time_zone(Some("ru"), 55.03, 82.92), Some("Asia/Novosibirsk"));
+        assert_eq!(time_zone(Some("ru"), 43.12, 131.9), Some("Asia/Vladivostok"));
+        assert_eq!(time_zone(Some("ru"), 54.71, 20.51), Some("Europe/Kaliningrad"));
+        // Нью-Йорк, Чикаго, Денвер, Финикс, Лос-Анджелес.
+        assert_eq!(time_zone(Some("us"), 40.71, -74.0), Some("America/New_York"));
+        assert_eq!(time_zone(Some("us"), 41.88, -87.63), Some("America/Chicago"));
+        assert_eq!(time_zone(Some("us"), 39.74, -104.99), Some("America/Denver"));
+        assert_eq!(time_zone(Some("us"), 33.45, -112.07), Some("America/Phoenix"));
+        assert_eq!(time_zone(Some("us"), 34.05, -118.24), Some("America/Los_Angeles"));
+        assert_eq!(time_zone(Some("au"), -33.87, 151.21), Some("Australia/Sydney"));
+        assert_eq!(time_zone(Some("au"), -31.95, 115.86), Some("Australia/Perth"));
+        assert_eq!(time_zone(Some("xx"), 0.0, 0.0), None);
+        assert_eq!(time_zone(None, 53.9, 27.56), None);
     }
 
     #[test]
